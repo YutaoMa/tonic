@@ -2,3 +2,6 @@ target/
 **/*.rs.bk
 Cargo.lock
 tags
+.env
+
+/xds-client/proto
