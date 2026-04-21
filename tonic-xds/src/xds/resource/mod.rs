@@ -14,6 +14,7 @@ pub(crate) mod cluster;
 pub(crate) mod endpoints;
 pub(crate) mod listener;
 pub(crate) mod route_config;
+pub(crate) mod string_matcher;
 
 pub(crate) use cluster::ClusterResource;
 pub(crate) use endpoints::EndpointsResource;
