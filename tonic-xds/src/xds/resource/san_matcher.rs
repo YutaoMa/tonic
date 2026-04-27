@@ -24,10 +24,7 @@ pub(crate) enum SanMatcher {
     Uri(StringMatcher),
     Email(StringMatcher),
     IpAddress(StringMatcher),
-    OtherName {
-        oid: String,
-        matcher: StringMatcher,
-    },
+    OtherName { oid: String, matcher: StringMatcher },
 }
 
 /// A SAN entry extracted from a peer X.509 certificate.
@@ -232,7 +229,8 @@ mod tests {
 
     #[test]
     fn ip_address_canonical_match() {
-        let m = SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("2001:db8::1"))).unwrap();
+        let m =
+            SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("2001:db8::1"))).unwrap();
         // Expanded form of the same IPv6 address.
         let canonical: IpAddr = "2001:0db8:0000:0000:0000:0000:0000:0001".parse().unwrap();
         assert!(m.matches_any(&[SanEntry::IpAddress(canonical)]));
@@ -240,7 +238,8 @@ mod tests {
 
     #[test]
     fn ip_address_ipv4_match() {
-        let m = SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("192.168.1.1"))).unwrap();
+        let m =
+            SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("192.168.1.1"))).unwrap();
         assert!(m.matches_any(&[SanEntry::IpAddress("192.168.1.1".parse().unwrap())]));
         assert!(!m.matches_any(&[SanEntry::IpAddress("192.168.1.2".parse().unwrap())]));
     }
@@ -259,7 +258,8 @@ mod tests {
     #[test]
     fn ip_address_ipv6_canonical_form_is_lowercased_zero_compressed() {
         // The matcher value is the canonical RFC 5952 form.
-        let m = SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("2001:db8::1"))).unwrap();
+        let m =
+            SanMatcher::from_proto(san_proto(SanType::IpAddress, exact("2001:db8::1"))).unwrap();
         // Various non-canonical inputs that parse to the same address must match.
         let canonical: IpAddr = "2001:0DB8:0000:0000:0000:0000:0000:0001".parse().unwrap();
         assert!(m.matches_any(&[SanEntry::IpAddress(canonical)]));
@@ -297,8 +297,7 @@ mod tests {
 
     #[test]
     fn unspecified_san_type_is_rejected() {
-        let err =
-            SanMatcher::from_proto(san_proto(SanType::Unspecified, exact("x"))).unwrap_err();
+        let err = SanMatcher::from_proto(san_proto(SanType::Unspecified, exact("x"))).unwrap_err();
         assert!(err.to_string().contains("UNSPECIFIED"));
     }
 

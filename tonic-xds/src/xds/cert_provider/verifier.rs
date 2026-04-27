@@ -16,7 +16,9 @@ use std::sync::Arc;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::oid_registry::OID_X509_EXT_SUBJECT_ALT_NAME;
 use x509_parser::prelude::FromDer;
@@ -55,8 +57,13 @@ impl ServerCertVerifier for XdsServerCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         // A29 SAN matching uses "any" semantics: at least one matcher must match
         // some SAN entry. Empty matcher list means CA-trust-only authorization.
@@ -220,9 +227,9 @@ fn fetch_provider_data(
     name: &str,
     role: &str,
 ) -> Result<Arc<CertificateData>, ClientConfigError> {
-    let provider = registry.get(name).ok_or_else(|| {
-        ClientConfigError::Provider(format!("unknown {role} instance '{name}'"))
-    })?;
+    let provider = registry
+        .get(name)
+        .ok_or_else(|| ClientConfigError::Provider(format!("unknown {role} instance '{name}'")))?;
     Ok(provider.fetch()?)
 }
 
@@ -273,7 +280,9 @@ mod tests {
 
     #[test]
     fn extract_sans_dns() {
-        let der = gen_cert_with_sans(vec![RcgenSanType::DnsName("api.example.com".try_into().unwrap())]);
+        let der = gen_cert_with_sans(vec![RcgenSanType::DnsName(
+            "api.example.com".try_into().unwrap(),
+        )]);
         let sans = extract_sans(&der).unwrap();
         assert_eq!(sans, vec![SanEntry::Dns("api.example.com".into())]);
     }
@@ -301,7 +310,9 @@ mod tests {
 
     #[test]
     fn extract_sans_ipv4() {
-        let der = gen_cert_with_sans(vec![RcgenSanType::IpAddress("192.168.1.5".parse().unwrap())]);
+        let der = gen_cert_with_sans(vec![RcgenSanType::IpAddress(
+            "192.168.1.5".parse().unwrap(),
+        )]);
         let sans = extract_sans(&der).unwrap();
         assert_eq!(
             sans,
@@ -311,7 +322,9 @@ mod tests {
 
     #[test]
     fn extract_sans_ipv6() {
-        let der = gen_cert_with_sans(vec![RcgenSanType::IpAddress("2001:db8::1".parse().unwrap())]);
+        let der = gen_cert_with_sans(vec![RcgenSanType::IpAddress(
+            "2001:db8::1".parse().unwrap(),
+        )]);
         let sans = extract_sans(&der).unwrap();
         assert_eq!(
             sans,

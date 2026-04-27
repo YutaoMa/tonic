@@ -3,7 +3,7 @@ use std::error::Error;
 use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::oneshot};
 use tonic::server::NamedService;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Server, ServerTlsConfig};
+use tonic::transport::{ClientTlsConfig, Endpoint, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
 pub(crate) use crate::testutil::proto::helloworld::{
@@ -58,10 +58,9 @@ impl Greeter for FailFirstNGreeter {
     }
 }
 
-/// A test server that runs a gRPC service and provides a channel for clients to connect.
+/// A test server that runs a gRPC service. Tests connect via the registry's
+/// `PlaintextConnector`, which dials the server at `addr`.
 pub(crate) struct TestServer {
-    /// The gRPC channel for talking to the test server.
-    pub channel: Channel,
     /// Signal the server to shutdown.
     pub shutdown: oneshot::Sender<()>,
     /// Handle to wait for server to exit.
@@ -111,19 +110,19 @@ pub(crate) async fn spawn_greeter_server(
         Ok(())
     });
 
-    let channel = if let Some(client_tls) = client_tls {
-        let endpoint_str = format!("https://{addr}");
-        Endpoint::from_shared(endpoint_str)?
+    // Wait until the server is reachable (or fail loudly).
+    if let Some(client_tls) = client_tls {
+        Endpoint::from_shared(format!("https://{addr}"))?
             .tls_config(client_tls)?
             .connect()
-            .await?
+            .await?;
     } else {
-        let endpoint_str = format!("http://{addr}");
-        Endpoint::from_shared(endpoint_str)?.connect().await?
-    };
+        Endpoint::from_shared(format!("http://{addr}"))?
+            .connect()
+            .await?;
+    }
 
     Ok(TestServer {
-        channel,
         shutdown: tx,
         handle,
         addr,
@@ -151,12 +150,12 @@ pub(crate) async fn spawn_fail_first_n_server(
             .await
     });
 
-    let channel = Endpoint::from_shared(format!("http://{addr}"))?
+    // Wait until the server is reachable.
+    Endpoint::from_shared(format!("http://{addr}"))?
         .connect()
         .await?;
 
     Ok(TestServer {
-        channel,
         shutdown: tx,
         handle,
         addr,

@@ -70,16 +70,14 @@ pub(crate) fn parse_transport_socket(
     let upstream = UpstreamTlsContext::decode(any.value.as_slice())
         .map_err(|e| Error::Validation(format!("failed to decode UpstreamTlsContext: {e}")))?;
 
-    let common = upstream.common_tls_context.ok_or_else(|| {
-        Error::Validation("UpstreamTlsContext missing common_tls_context".into())
-    })?;
+    let common = upstream
+        .common_tls_context
+        .ok_or_else(|| Error::Validation("UpstreamTlsContext missing common_tls_context".into()))?;
 
     parse_common_tls_context(common).map(Some)
 }
 
-fn parse_common_tls_context(
-    ctx: CommonTlsContext,
-) -> xds_client::Result<ClusterSecurityConfig> {
+fn parse_common_tls_context(ctx: CommonTlsContext) -> xds_client::Result<ClusterSecurityConfig> {
     reject_unsupported_common_fields(&ctx)?;
 
     // Identity (mTLS client cert) — optional.
@@ -119,17 +117,17 @@ fn resolve_validation_context(
     use common_tls_context::ValidationContextType;
     match vct {
         Some(ValidationContextType::ValidationContext(ctx)) => Ok(ctx),
-        Some(ValidationContextType::CombinedValidationContext(combined)) => combined
-            .default_validation_context
-            .ok_or_else(|| {
+        Some(ValidationContextType::CombinedValidationContext(combined)) => {
+            combined.default_validation_context.ok_or_else(|| {
                 Error::Validation(
                     "CombinedValidationContext missing default_validation_context".into(),
                 )
-            }),
+            })
+        }
         // SDS-based validation is not supported in A29.
-        Some(ValidationContextType::ValidationContextSdsSecretConfig(_)) => Err(
-            Error::Validation("SDS-based validation_context is not supported".into()),
-        ),
+        Some(ValidationContextType::ValidationContextSdsSecretConfig(_)) => Err(Error::Validation(
+            "SDS-based validation_context is not supported".into(),
+        )),
         // Deprecated variants.
         Some(_) => Err(Error::Validation(
             "unsupported validation_context_type variant".into(),
@@ -142,9 +140,7 @@ fn resolve_validation_context(
 
 /// SAN matchers: typed wins per envoy proto semantics. Falls back to the
 /// deprecated DNS-only `match_subject_alt_names` when typed is empty.
-fn parse_san_matchers(
-    ctx: &CertificateValidationContext,
-) -> xds_client::Result<Vec<SanMatcher>> {
+fn parse_san_matchers(ctx: &CertificateValidationContext) -> xds_client::Result<Vec<SanMatcher>> {
     if !ctx.match_typed_subject_alt_names.is_empty() {
         return ctx
             .match_typed_subject_alt_names
@@ -224,8 +220,7 @@ fn reject(set: bool, field: &str) -> xds_client::Result<()> {
 mod tests {
     use super::*;
     use envoy_types::pb::envoy::extensions::transport_sockets::tls::v3::{
-        CertificateProviderPluginInstance, SubjectAltNameMatcher,
-        subject_alt_name_matcher::SanType,
+        CertificateProviderPluginInstance, SubjectAltNameMatcher, subject_alt_name_matcher::SanType,
     };
     use envoy_types::pb::envoy::r#type::matcher::v3::StringMatcher as StringMatcherProto;
     use envoy_types::pb::envoy::r#type::matcher::v3::string_matcher::MatchPattern;
@@ -247,7 +242,9 @@ mod tests {
 
     fn common_ctx(cvc: CertificateValidationContext) -> CommonTlsContext {
         CommonTlsContext {
-            validation_context_type: Some(common_tls_context::ValidationContextType::ValidationContext(cvc)),
+            validation_context_type: Some(
+                common_tls_context::ValidationContextType::ValidationContext(cvc),
+            ),
             ..Default::default()
         }
     }
@@ -285,9 +282,11 @@ mod tests {
     fn mtls_with_identity() {
         let common = CommonTlsContext {
             tls_certificate_provider_instance: Some(provider_instance("client_id")),
-            validation_context_type: Some(common_tls_context::ValidationContextType::ValidationContext(
-                ca_validation_ctx("root_ca"),
-            )),
+            validation_context_type: Some(
+                common_tls_context::ValidationContextType::ValidationContext(ca_validation_ctx(
+                    "root_ca",
+                )),
+            ),
             ..Default::default()
         };
         let ts = wrap_upstream(common);
@@ -405,7 +404,10 @@ mod tests {
             })),
         };
         let err = parse_transport_socket(Some(ts)).unwrap_err();
-        assert!(err.to_string().contains("does not match UpstreamTlsContext"));
+        assert!(
+            err.to_string()
+                .contains("does not match UpstreamTlsContext")
+        );
     }
 
     #[test]
@@ -455,9 +457,11 @@ mod tests {
         use envoy_types::pb::envoy::extensions::transport_sockets::tls::v3::TlsCertificate;
         let common = CommonTlsContext {
             tls_certificates: vec![TlsCertificate::default()],
-            validation_context_type: Some(common_tls_context::ValidationContextType::ValidationContext(
-                ca_validation_ctx("root_ca"),
-            )),
+            validation_context_type: Some(
+                common_tls_context::ValidationContextType::ValidationContext(ca_validation_ctx(
+                    "root_ca",
+                )),
+            ),
             ..Default::default()
         };
         let err = parse_transport_socket(Some(wrap_upstream(common))).unwrap_err();

@@ -72,6 +72,13 @@ impl<T> WatchMap<T> {
         CacheWatch::new(tx.subscribe())
     }
 
+    /// Returns the current value for `key`, if present.
+    ///
+    /// Synchronous one-shot read. Does not register a watcher.
+    fn get(&self, key: &str) -> Option<Arc<T>> {
+        self.inner.get(key)?.borrow().clone()
+    }
+
     /// Removes the watch channel for the given key.
     ///
     /// Dropping the sender closes all watcher receivers.
@@ -141,9 +148,13 @@ impl XdsCache {
     }
 
     /// Watches cluster resource changes for a specific cluster.
-    #[allow(dead_code)] // Will be used when LB policy dispatch is wired (A48).
     pub(crate) fn watch_cluster(&self, name: &str) -> CacheWatch<ClusterResource> {
         self.clusters.watch(name)
+    }
+
+    /// Returns the current cluster resource for `name`, if any.
+    pub(crate) fn get_cluster(&self, name: &str) -> Option<Arc<ClusterResource>> {
+        self.clusters.get(name)
     }
 
     /// Updates the endpoint resource for a cluster and notifies watchers.
