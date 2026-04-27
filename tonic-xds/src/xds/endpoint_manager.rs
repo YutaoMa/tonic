@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::BoxError;
 use tower::discover::Change;
 
-use crate::client::endpoint::EndpointAddress;
+use crate::client::endpoint::{Connector, EndpointAddress};
 use crate::client::lb::BoxDiscover;
 use crate::xds::cache::CacheWatch;
 use crate::xds::resource::EndpointsResource;
@@ -29,13 +29,14 @@ const ENDPOINT_CHANNEL_CAPACITY: usize = 64;
 /// (typically `XdsResourceManager`) obtains a [`CacheWatch`] from the
 /// [`XdsCache`](crate::xds::cache::XdsCache) and passes it here.
 pub(crate) struct EndpointManager<S: Send + 'static> {
-    /// Creates a service for each new endpoint address (e.g., wrapping a
-    /// lazily-connected `tonic::transport::Channel` in an `EndpointChannel`).
-    connector: Arc<dyn Fn(&EndpointAddress) -> S + Send + Sync>,
+    /// Builds a service for each new endpoint address. Captures cluster-level
+    /// config (TLS, HTTP/2 settings, timeouts) at construction time per the
+    /// [`Connector`] contract.
+    connector: Arc<dyn Connector<Service = S> + Send + Sync>,
 }
 
 impl<S: Send + 'static> EndpointManager<S> {
-    pub(crate) fn new(connector: Arc<dyn Fn(&EndpointAddress) -> S + Send + Sync>) -> Self {
+    pub(crate) fn new(connector: Arc<dyn Connector<Service = S> + Send + Sync>) -> Self {
         Self { connector }
     }
 
@@ -67,7 +68,7 @@ impl<S: Send + 'static> EndpointManager<S> {
 /// new endpoints followed by `Remove` for gone ones.
 async fn diff_loop<S: Send + 'static>(
     mut watch: CacheWatch<EndpointsResource>,
-    connector: Arc<dyn Fn(&EndpointAddress) -> S + Send + Sync>,
+    connector: Arc<dyn Connector<Service = S> + Send + Sync>,
     tx: mpsc::Sender<Result<Change<EndpointAddress, S>, BoxError>>,
 ) {
     let mut active: HashSet<EndpointAddress> = HashSet::new();
@@ -79,7 +80,7 @@ async fn diff_loop<S: Send + 'static>(
             .collect();
 
         for added in new_set.difference(&active) {
-            let svc = connector(added);
+            let svc = connector.connect(added).await;
             if tx
                 .send(Ok(Change::Insert(added.clone(), svc)))
                 .await
@@ -106,8 +107,23 @@ mod tests {
     use crate::xds::resource::endpoints::{HealthStatus, LocalityEndpoints, ResolvedEndpoint};
     use tokio_stream::StreamExt;
 
-    fn test_connector() -> Arc<dyn Fn(&EndpointAddress) -> String + Send + Sync> {
-        Arc::new(|addr: &EndpointAddress| addr.to_string())
+    /// Test [`Connector`] that just renders the address as a String "service".
+    struct StringConnector;
+
+    impl Connector for StringConnector {
+        type Service = String;
+
+        fn connect(
+            &self,
+            addr: &EndpointAddress,
+        ) -> crate::common::async_util::BoxFuture<Self::Service> {
+            let s = addr.to_string();
+            Box::pin(async move { s })
+        }
+    }
+
+    fn test_connector() -> Arc<dyn Connector<Service = String> + Send + Sync> {
+        Arc::new(StringConnector)
     }
 
     fn make_endpoints(cluster: &str, addrs: &[(&str, u16)]) -> Arc<EndpointsResource> {

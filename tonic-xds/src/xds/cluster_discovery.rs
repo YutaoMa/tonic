@@ -1,37 +1,44 @@
 //! xDS-backed [`ClusterDiscovery`] implementation.
 //!
-//! Bridges [`XdsCache`] endpoint watches and [`EndpointManager`] diffing
-//! to provide the [`ClusterDiscovery`] trait required by [`XdsLbService`].
+//! Builds a per-cluster [`Connector`] based on the cluster's
+//! [`ClusterSecurityConfig`] (parsed from `Cluster.transport_socket`) and a
+//! shared [`CertProviderRegistry`] (built from the bootstrap
+//! `certificate_providers` map).
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt as _;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
+use tower::BoxError;
 
-use crate::client::endpoint::{EndpointAddress, EndpointChannel};
+use crate::client::endpoint::{Connector, EndpointAddress, EndpointChannel};
 use crate::client::lb::{BoxDiscover, ClusterDiscovery};
+use crate::common::async_util::BoxFuture;
 use crate::xds::cache::XdsCache;
+use crate::xds::cert_provider::CertProviderRegistry;
 use crate::xds::endpoint_manager::EndpointManager;
+use crate::xds::resource::ClusterResource;
 
-/// Shared connector function that creates endpoint services from addresses.
-// TODO: Refactor to a trait when adding TLS support (A29). A trait can carry
-// configuration (TLS settings, timeouts) and be shared across EndpointManager,
-// ClusterDiscovery, and LB reconnect logic.
-pub(crate) type EndpointConnector =
-    Arc<dyn Fn(&EndpointAddress) -> EndpointChannel<Channel> + Send + Sync>;
+const DISCOVER_CHANNEL_CAPACITY: usize = 64;
 
 /// xDS-backed cluster discovery that resolves cluster names into endpoint
 /// change streams by watching the [`XdsCache`].
 pub(crate) struct XdsClusterDiscovery {
     cache: Arc<XdsCache>,
-    endpoint_manager: EndpointManager<EndpointChannel<Channel>>,
+    cert_provider_registry: Arc<CertProviderRegistry>,
 }
 
 impl XdsClusterDiscovery {
     /// Creates a new `XdsClusterDiscovery`.
-    pub(crate) fn new(cache: Arc<XdsCache>, connector: EndpointConnector) -> Self {
+    pub(crate) fn new(
+        cache: Arc<XdsCache>,
+        cert_provider_registry: Arc<CertProviderRegistry>,
+    ) -> Self {
         Self {
             cache,
-            endpoint_manager: EndpointManager::new(connector),
+            cert_provider_registry,
         }
     }
 }
@@ -41,29 +48,90 @@ impl ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>> for XdsClusterD
         &self,
         cluster_name: &str,
     ) -> BoxDiscover<EndpointAddress, EndpointChannel<Channel>> {
-        let watch = self.cache.watch_endpoints(cluster_name);
-        self.endpoint_manager.discover_endpoints(watch)
+        let cache = self.cache.clone();
+        let registry = self.cert_provider_registry.clone();
+        let cluster_name = cluster_name.to_string();
+
+        let (tx, rx) = mpsc::channel(DISCOVER_CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            // Wait for the first ClusterResource to arrive so we can build a
+            // connector matched to its security config. The cluster watch
+            // closes if the cluster is removed from the cache, in which case
+            // we exit silently — the receiver will see an empty stream.
+            let mut cluster_watch = cache.watch_cluster(&cluster_name);
+            let Some(cluster) = cluster_watch.next().await else {
+                return;
+            };
+
+            let connector = match build_connector(&cluster, &registry) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Err(Box::new(e) as BoxError)).await;
+                    return;
+                }
+            };
+
+            let manager = EndpointManager::new(connector);
+            let mut stream = manager.discover_endpoints(cache.watch_endpoints(&cluster_name));
+            while let Some(item) = stream.next().await {
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Box::pin(ReceiverStream::new(rx))
     }
 }
 
-/// Default connector that creates a lazily-connected [`EndpointChannel`] for
-/// each endpoint address.
+/// Build a [`Connector`] for a given cluster based on its security config.
 ///
-/// Uses insecure (plaintext) connections.
-// TODO(PR2/A29): Replace this with a TLS-aware connector that receives the
-// CertProviderRegistry and per-cluster UpstreamTlsContext (from ClusterResource).
-// When a cluster has transport_socket configured, the connector should:
-//   1. Look up root + identity cert provider instances from the registry
-//   2. Build ClientTlsConfig with the fetched CertificateData
-//   3. Apply SAN matching for server authorization
-//   4. Use connect() instead of connect_lazy() for TLS handshake
-pub(crate) fn default_endpoint_connector(addr: &EndpointAddress) -> EndpointChannel<Channel> {
-    let uri = format!("http://{addr}");
-    // Safety: EndpointAddress only holds validated Ipv4/Ipv6/Hostname + u16 port,
-    // and its Display impl produces "ip:port" or "hostname:port". Prefixing with
-    // "http://" always yields a valid URI, so from_shared cannot fail here.
-    let channel = Endpoint::from_shared(uri)
-        .expect("EndpointAddress Display guarantees valid URI")
-        .connect_lazy();
-    EndpointChannel::new(channel)
+/// Returns a [`PlaintextConnector`] when the cluster has no `transport_socket`.
+/// When TLS is required, this currently returns
+/// [`ConnectorBuildError::TlsNotWired`] — the rustls-side parsing/validation
+/// (see [`crate::xds::cert_provider::verifier`]) is in place, but actually
+/// plumbing a custom [`rustls::client::danger::ServerCertVerifier`] into a
+/// `tonic::transport::Channel` requires `ClientTlsConfig::with_server_cert_verifier`,
+/// which does not yet exist upstream.
+fn build_connector(
+    cluster: &ClusterResource,
+    _registry: &Arc<CertProviderRegistry>,
+) -> Result<
+    Arc<dyn Connector<Service = EndpointChannel<Channel>> + Send + Sync>,
+    ConnectorBuildError,
+> {
+    match &cluster.security {
+        None => Ok(Arc::new(PlaintextConnector)),
+        Some(_) => Err(ConnectorBuildError::TlsNotWired),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConnectorBuildError {
+    #[error(
+        "data-plane TLS is not yet wired: tonic's ClientTlsConfig has no hook for \
+         injecting a custom rustls::ServerCertVerifier (required for gRFC A29 SAN \
+         matching). Tracking upstream"
+    )]
+    TlsNotWired,
+}
+
+/// Plaintext [`Connector`] producing a lazily-connected `tonic::Channel`.
+pub(crate) struct PlaintextConnector;
+
+impl Connector for PlaintextConnector {
+    type Service = EndpointChannel<Channel>;
+
+    fn connect(&self, addr: &EndpointAddress) -> BoxFuture<Self::Service> {
+        let uri = format!("http://{addr}");
+        // EndpointAddress only holds validated Ipv4/Ipv6/Hostname + u16
+        // port, and its Display impl produces "ip:port" or "hostname:port".
+        // Prefixing with "http://" always yields a valid URI.
+        let channel = Endpoint::from_shared(uri)
+            .expect("EndpointAddress Display guarantees valid URI")
+            .connect_lazy();
+        let result = EndpointChannel::new(channel);
+        Box::pin(async move { result })
+    }
 }

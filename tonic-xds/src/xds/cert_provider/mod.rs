@@ -11,6 +11,8 @@
 //! [`CertificateProviderPluginInstance`]: https://github.com/envoyproxy/envoy/blob/main/api/envoy/extensions/transport_sockets/tls/v3/common.proto
 
 pub(crate) mod file_watcher;
+#[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
+pub(crate) mod verifier;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +76,7 @@ impl CertificateData {
 
 /// Errors from certificate provider operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CertProviderError {
+pub enum CertProviderError {
     #[error("failed to read certificate file '{path}': {source}")]
     FileRead {
         path: String,
