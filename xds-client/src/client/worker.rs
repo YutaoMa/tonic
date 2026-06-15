@@ -37,6 +37,15 @@ struct ClientAttrs {
 }
 
 impl ClientAttrs {
+    /// Sentinel `grpc.xds.authority` value used for the unnamed top-level
+    /// (non-federated) authority.
+    ///
+    /// Matches grpc-go's top-level placeholder.
+    ///
+    /// TODO: once federated bootstrap support lands, derive the authority from
+    /// the resource name (`xdstp://<authority>/...`) on a per-resource basis.
+    const TOP_LEVEL_AUTHORITY: &'static str = "#old";
+
     fn connection_attrs(&self) -> [KeyValue; 2] {
         [
             KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
@@ -55,7 +64,10 @@ impl ClientAttrs {
     fn cache_state_attrs(&self, type_url: &Arc<str>, cache_state: &'static str) -> [KeyValue; 4] {
         [
             KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
-            KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
+            KeyValue::str(
+                metrics::attrs::GRPC_XDS_AUTHORITY,
+                Self::TOP_LEVEL_AUTHORITY,
+            ),
             KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
             KeyValue::str(metrics::attrs::GRPC_XDS_CACHE_STATE, cache_state),
         ]
@@ -161,6 +173,21 @@ impl RecorderHandle {
             &metrics::instruments::XDS_CLIENT_RESOURCES,
             1,
             &self.attrs.cache_state_attrs(type_url, new_label),
+        );
+    }
+
+    /// `grpc.xds_client.resources` — emit a `-1` delta for a resource
+    /// that is leaving the cache without any successor state.
+    fn record_resource_removal(&self, type_url: &Arc<str>, prev: &ResourceState) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.add_up_down_counter_i64(
+            &metrics::instruments::XDS_CLIENT_RESOURCES,
+            -1,
+            &self
+                .attrs
+                .cache_state_attrs(type_url, prev.cache_state_label()),
         );
     }
 }
@@ -577,6 +604,7 @@ where
             let transport = match self.transport_builder.build(server).await {
                 Ok(t) => t,
                 Err(_) => {
+                    self.recorder.record_server_failure();
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -591,6 +619,7 @@ where
                     s
                 }
                 Err(_) => {
+                    self.recorder.record_server_failure();
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -822,6 +851,10 @@ where
         let subscriptions_changed = type_state.subscription != old_subscription;
 
         if type_state.watchers.is_empty() {
+            for cached in type_state.cache.values() {
+                self.recorder
+                    .record_resource_removal(&type_state.type_url, &cached.state);
+            }
             self.type_states.remove(&type_url);
             // Cancel all pending resource timers for this type.
             self.resource_timers.retain(|key, _| key.0 != type_url);
@@ -1375,10 +1408,8 @@ mod tests {
             Some("envoy.config.listener.v3.Listener")
         );
         assert_eq!(attr(&events[0], "grpc.target"), Some("xds:///my-service"));
-        assert_eq!(
-            attr(&events[0], "grpc.xds.server"),
-            Some("xds.example.com:443")
-        );
+        assert_eq!(attr(&events[0], "grpc.xds.authority"), Some("#old"));
+        assert_eq!(attr(&events[0], "grpc.xds.server"), None);
     }
 
     #[test]
@@ -1410,5 +1441,41 @@ mod tests {
         );
 
         assert!(recorder.take().is_empty());
+    }
+
+    #[test]
+    fn removal_emits_single_decrement_against_prev_state() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_removal(&type_url, &ResourceState::Received);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].instrument, "grpc.xds_client.resources");
+        assert_eq!(events[0].kind, Measurement::UpDownI64(-1));
+        assert_eq!(attr(&events[0], "grpc.xds.cache_state"), Some("acked"));
+        assert_eq!(
+            attr(&events[0], "grpc.xds.resource_type"),
+            Some("envoy.config.listener.v3.Listener")
+        );
+    }
+
+    #[test]
+    fn add_then_remove_balances_to_zero() {
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(&type_url, None, &ResourceState::Received);
+        handle.record_resource_removal(&type_url, &ResourceState::Received);
+
+        let events = recorder.take();
+        assert_eq!(events.len(), 2);
+        let net: i64 = events
+            .iter()
+            .map(|e| match e.kind {
+                Measurement::UpDownI64(v) => v,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(net, 0);
     }
 }
