@@ -44,75 +44,89 @@ impl ClientAttrs {
         ]
     }
 
-    fn type_attrs(&self, type_url: &str) -> [KeyValue; 3] {
+    fn type_attrs(&self, type_url: &Arc<str>) -> [KeyValue; 3] {
         [
             KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
             KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
-            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, type_url.to_string()),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
         ]
     }
 
-    fn cache_state_attrs(&self, type_url: &str, cache_state: &'static str) -> [KeyValue; 4] {
+    fn cache_state_attrs(&self, type_url: &Arc<str>, cache_state: &'static str) -> [KeyValue; 4] {
         [
             KeyValue::str(metrics::attrs::GRPC_TARGET, Arc::clone(&self.target)),
             KeyValue::str(metrics::attrs::GRPC_XDS_SERVER, Arc::clone(&self.server)),
-            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, type_url.to_string()),
+            KeyValue::str(metrics::attrs::GRPC_XDS_RESOURCE_TYPE, Arc::clone(type_url)),
             KeyValue::str(metrics::attrs::GRPC_XDS_CACHE_STATE, cache_state),
         ]
     }
 }
 
-/// A78 metric emission verbs on the worker's recorder.
-///
-/// Inherent methods on `dyn MetricsRecorder` (legal because the trait is
-/// defined in this crate). `pub(crate)` keeps them invisible to downstream
-/// consumers — the methods exist only for use by this crate's worker.
-///
-/// Call sites look like `self.recorder.record_X(&self.attrs, ...)`. The
-/// receiver and `attrs` borrow are split-borrow-friendly with `&mut self`
-/// borrows on other worker fields (e.g. `self.type_states`), so the mutation
-/// handlers don't need to be restructured to defer emission.
-impl dyn MetricsRecorder {
+/// Worker-side wrapper around an optional [`MetricsRecorder`] backend.
+pub(crate) struct RecorderHandle {
+    recorder: Option<Arc<dyn MetricsRecorder>>,
+    attrs: ClientAttrs,
+}
+
+impl RecorderHandle {
+    pub(crate) fn new(recorder: Option<Arc<dyn MetricsRecorder>>, target: Arc<str>) -> Self {
+        Self {
+            recorder,
+            attrs: ClientAttrs {
+                target,
+                server: Arc::from(""),
+            },
+        }
+    }
+
+    /// Update the `grpc.xds.server` attribute for subsequent emissions.
+    pub(crate) fn set_server(&mut self, server: Arc<str>) {
+        self.attrs.server = server;
+    }
+
     /// `grpc.xds_client.connected` — 1 for connected, 0 for disconnected.
-    fn record_connected(&self, attrs: &ClientAttrs, connected: bool) {
-        self.record_gauge_i64(
+    fn record_connected(&self, connected: bool) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.record_gauge_i64(
             &metrics::instruments::XDS_CLIENT_CONNECTED,
             if connected { 1 } else { 0 },
-            &attrs.connection_attrs(),
+            &self.attrs.connection_attrs(),
         );
     }
 
     /// `grpc.xds_client.server_failure` — incremented once per failed connection cycle.
-    fn record_server_failure(&self, attrs: &ClientAttrs) {
-        self.add_counter_u64(
+    fn record_server_failure(&self) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
+        recorder.add_counter_u64(
             &metrics::instruments::XDS_CLIENT_SERVER_FAILURE,
             1,
-            &attrs.connection_attrs(),
+            &self.attrs.connection_attrs(),
         );
     }
 
     /// `grpc.xds_client.resource_updates_valid` + `_invalid`, with aggregated
     /// counts from a single response.
-    fn record_resource_updates(
-        &self,
-        attrs: &ClientAttrs,
-        type_url: &str,
-        valid: u64,
-        invalid: u64,
-    ) {
+    fn record_resource_updates(&self, type_url: &Arc<str>, valid: u64, invalid: u64) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
         if valid == 0 && invalid == 0 {
             return;
         }
-        let type_attrs = attrs.type_attrs(type_url);
+        let type_attrs = self.attrs.type_attrs(type_url);
         if valid > 0 {
-            self.add_counter_u64(
+            recorder.add_counter_u64(
                 &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_VALID,
                 valid,
                 &type_attrs,
             );
         }
         if invalid > 0 {
-            self.add_counter_u64(
+            recorder.add_counter_u64(
                 &metrics::instruments::XDS_CLIENT_RESOURCE_UPDATES_INVALID,
                 invalid,
                 &type_attrs,
@@ -124,27 +138,29 @@ impl dyn MetricsRecorder {
     /// `prev` is `None` when the resource is being inserted into the cache for the first time.
     fn record_resource_transition(
         &self,
-        attrs: &ClientAttrs,
-        type_url: &str,
+        type_url: &Arc<str>,
         prev: Option<&ResourceState>,
         new: &ResourceState,
     ) {
+        let Some(recorder) = &self.recorder else {
+            return;
+        };
         let new_label = new.cache_state_label();
         let prev_label = prev.map(ResourceState::cache_state_label);
         if prev_label == Some(new_label) {
             return;
         }
         if let Some(prev) = prev_label {
-            self.add_up_down_counter_i64(
+            recorder.add_up_down_counter_i64(
                 &metrics::instruments::XDS_CLIENT_RESOURCES,
                 -1,
-                &attrs.cache_state_attrs(type_url, prev),
+                &self.attrs.cache_state_attrs(type_url, prev),
             );
         }
-        self.add_up_down_counter_i64(
+        recorder.add_up_down_counter_i64(
             &metrics::instruments::XDS_CLIENT_RESOURCES,
             1,
-            &attrs.cache_state_attrs(type_url, new_label),
+            &self.attrs.cache_state_attrs(type_url, new_label),
         );
     }
 }
@@ -330,6 +346,9 @@ impl CachedResource {
 
 /// Per-type_url state tracking.
 struct TypeState {
+    /// Reference-counted type URL, shared with metric attribute slots so
+    /// per-emission attribute construction is a cheap.
+    type_url: Arc<str>,
     /// Decoder function for this resource type.
     decoder: DecoderFn,
     /// Version from last successful response.
@@ -349,6 +368,7 @@ struct TypeState {
 impl std::fmt::Debug for TypeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TypeState")
+            .field("type_url", &self.type_url)
             .field("decoder", &"<decoder fn>")
             .field("version_info", &self.version_info)
             .field("nonce", &self.nonce)
@@ -364,8 +384,9 @@ impl std::fmt::Debug for TypeState {
 }
 
 impl TypeState {
-    fn new(decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
+    fn new(type_url: Arc<str>, decoder: DecoderFn, all_resources_required_in_sotw: bool) -> Self {
         Self {
+            type_url,
             decoder,
             version_info: String::new(),
             nonce: String::new(),
@@ -482,10 +503,9 @@ pub(crate) struct AdsWorker<TB, C, R> {
     /// Cancellation handles for resource timers (gRFC A57).
     /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
     resource_timers: HashMap<(String, String), oneshot::Sender<()>>,
-    /// Backend for recording metrics emitted by the worker (gRFC A78).
-    recorder: Arc<dyn MetricsRecorder>,
-    /// Per-client A78 metric attributes (`grpc.target` + `grpc.xds.server`).
-    attrs: ClientAttrs,
+    /// Optional backend + per-client A78 metric attributes
+    /// (`grpc.target` + `grpc.xds.server`).
+    recorder: RecorderHandle,
 }
 
 impl<TB, C, R> AdsWorker<TB, C, R>
@@ -502,8 +522,9 @@ where
         config: ClientConfig,
         command_tx: mpsc::Sender<WorkerCommand>,
         command_rx: mpsc::Receiver<WorkerCommand>,
-        recorder: Arc<dyn MetricsRecorder>,
+        recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
+        let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
         Self {
             transport_builder,
             codec,
@@ -516,11 +537,7 @@ where
             command_rx,
             type_states: HashMap::new(),
             resource_timers: HashMap::new(),
-            recorder,
-            attrs: ClientAttrs {
-                target: Arc::from(config.target.unwrap_or_default()),
-                server: Arc::from(""),
-            },
+            recorder: RecorderHandle::new(recorder, target),
         }
     }
 
@@ -555,7 +572,7 @@ where
                 Some(s) => s,
                 None => return, // No servers configured
             };
-            self.attrs.server = Arc::from(server.uri());
+            self.recorder.set_server(Arc::from(server.uri()));
 
             let transport = match self.transport_builder.build(server).await {
                 Ok(t) => t,
@@ -582,14 +599,14 @@ where
                 }
             };
 
-            self.recorder.record_connected(&self.attrs, true);
+            self.recorder.record_connected(true);
             let result = self.run_connected(stream).await;
-            self.recorder.record_connected(&self.attrs, false);
+            self.recorder.record_connected(false);
 
             match result {
                 Ok(()) => return, // shutdown
                 Err(_e) => {
-                    self.recorder.record_server_failure(&self.attrs);
+                    self.recorder.record_server_failure();
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -722,7 +739,9 @@ where
         let type_state = self
             .type_states
             .entry(type_url_string.clone())
-            .or_insert_with(|| TypeState::new(decoder, all_resources_required_in_sotw));
+            .or_insert_with(|| {
+                TypeState::new(Arc::from(type_url), decoder, all_resources_required_in_sotw)
+            });
 
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
@@ -768,8 +787,7 @@ where
         // Emit resources gauge transition for newly-inserted cache entry.
         if was_new {
             self.recorder.record_resource_transition(
-                &self.attrs,
-                &type_url_string,
+                &type_state.type_url,
                 None,
                 &ResourceState::Requested,
             );
@@ -849,8 +867,8 @@ where
         let response = self.codec.decode_response(bytes)?;
         let type_url = response.type_url.clone();
 
-        let decoder = match self.type_states.get(&type_url) {
-            Some(s) => &s.decoder,
+        let (type_url_arc, decoder) = match self.type_states.get(&type_url) {
+            Some(s) => (Arc::clone(&s.type_url), &s.decoder),
             None => {
                 return Ok(());
             }
@@ -884,7 +902,7 @@ where
         let valid_count = valid_resources.len() as u64;
         let invalid_count = (top_level_errors.len() + per_resource_errors.len()) as u64;
         self.recorder
-            .record_resource_updates(&self.attrs, &type_url, valid_count, invalid_count);
+            .record_resource_updates(&type_url_arc, valid_count, invalid_count);
 
         if let Some(type_state) = self.type_states.get_mut(&type_url) {
             type_state.nonce = response.nonce.clone();
@@ -967,8 +985,7 @@ where
                         CachedResource::received(Arc::new(resource.clone())),
                     );
                     self.recorder.record_resource_transition(
-                        &self.attrs,
-                        type_url,
+                        &s.type_url,
                         prev.as_ref().map(|c| &c.state),
                         &ResourceState::Received,
                     );
@@ -1024,8 +1041,7 @@ where
             CachedResource::nacked(error.to_string()),
         );
         self.recorder.record_resource_transition(
-            &self.attrs,
-            type_url,
+            &type_state.type_url,
             prev.as_ref().map(|c| &c.state),
             &ResourceState::NACKed(error.to_string()),
         );
@@ -1079,8 +1095,7 @@ where
                 .cache
                 .insert(name.clone(), CachedResource::does_not_exist());
             self.recorder.record_resource_transition(
-                &self.attrs,
-                type_url,
+                &type_state.type_url,
                 prev.as_ref().map(|c| &c.state),
                 &ResourceState::DoesNotExist,
             );
@@ -1215,8 +1230,7 @@ where
             .cache
             .insert(name.to_string(), CachedResource::does_not_exist());
         self.recorder.record_resource_transition(
-            &self.attrs,
-            type_url,
+            &type_state.type_url,
             prev.as_ref().map(|c| &c.state),
             &ResourceState::DoesNotExist,
         );
@@ -1331,31 +1345,25 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    fn test_attrs() -> ClientAttrs {
-        ClientAttrs {
-            target: Arc::from("xds:///my-service"),
-            server: Arc::from("xds.example.com:443"),
-        }
-    }
-
-    /// Returns a (capturing recorder, `dyn`-coerced clone) pair so tests can
-    /// drive emissions through the dyn handle and inspect the recorded events
-    /// through the typed handle.
-    fn test_recorder() -> (Arc<CapturingRecorder>, Arc<dyn MetricsRecorder>) {
+    /// Build a [`RecorderHandle`] backed by a [`CapturingRecorder`], wired
+    /// with the canonical test attributes used by the transition tests.
+    fn test_handle() -> (Arc<CapturingRecorder>, RecorderHandle) {
         let recorder = Arc::new(CapturingRecorder::default());
         let dyn_recorder: Arc<dyn MetricsRecorder> = recorder.clone();
-        (recorder, dyn_recorder)
+        let mut handle = RecorderHandle::new(Some(dyn_recorder), Arc::from("xds:///my-service"));
+        handle.set_server(Arc::from("xds.example.com:443"));
+        (recorder, handle)
+    }
+
+    fn test_type_url() -> Arc<str> {
+        Arc::from("envoy.config.listener.v3.Listener")
     }
 
     #[test]
     fn transition_from_none_emits_only_increment() {
-        let (recorder, dyn_recorder) = test_recorder();
-        dyn_recorder.record_resource_transition(
-            &test_attrs(),
-            "envoy.config.listener.v3.Listener",
-            None,
-            &ResourceState::Requested,
-        );
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(&type_url, None, &ResourceState::Requested);
 
         let events = recorder.take();
         assert_eq!(events.len(), 1);
@@ -1375,10 +1383,10 @@ mod tests {
 
     #[test]
     fn transition_emits_decrement_then_increment() {
-        let (recorder, dyn_recorder) = test_recorder();
-        dyn_recorder.record_resource_transition(
-            &test_attrs(),
-            "envoy.config.listener.v3.Listener",
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(
+            &type_url,
             Some(&ResourceState::Received),
             &ResourceState::NACKed("validation failed".into()),
         );
@@ -1393,10 +1401,10 @@ mod tests {
 
     #[test]
     fn transition_to_same_state_is_a_no_op() {
-        let (recorder, dyn_recorder) = test_recorder();
-        dyn_recorder.record_resource_transition(
-            &test_attrs(),
-            "envoy.config.listener.v3.Listener",
+        let (recorder, handle) = test_handle();
+        let type_url = test_type_url();
+        handle.record_resource_transition(
+            &type_url,
             Some(&ResourceState::NACKed("first".into())),
             &ResourceState::NACKed("second".into()),
         );

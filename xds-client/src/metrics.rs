@@ -4,18 +4,21 @@
 //! to receive metric measurements emitted by the client. Modeled after gRFC A79's
 //! `MetricsRecorder` abstraction.
 //!
-//! Only [`NoOpRecorder`] is provided in this crate today; consumers wanting to
-//! ship metrics to a real backend must implement [`MetricsRecorder`] themselves.
-//! A bundled OpenTelemetry implementation behind an `otel` Cargo feature is
-//! planned but not yet implemented.
+//! No bundled implementation is provided in this crate today; consumers wanting
+//! to ship metrics to a real backend must implement [`MetricsRecorder`]
+//! themselves. A bundled OpenTelemetry implementation behind an `otel` Cargo
+//! feature is planned but not yet implemented.
 //!
 //! # Example
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use xds_client::metrics::{MetricsRecorder, NoOpRecorder};
+//! use xds_client::metrics::MetricsRecorder;
 //!
-//! let recorder: Arc<dyn MetricsRecorder> = Arc::new(NoOpRecorder);
+//! struct MyRecorder;
+//! impl MetricsRecorder for MyRecorder { /* ... */ }
+//!
+//! let recorder: Arc<dyn MetricsRecorder> = Arc::new(MyRecorder);
 //! let client = XdsClient::builder(config, transport, codec, runtime)
 //!     .with_metrics_recorder(recorder)
 //!     .build();
@@ -223,19 +226,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     /// Record the current value of a push-model gauge.
     fn record_gauge_i64(&self, instrument: &'static Instrument, value: i64, attrs: &[KeyValue]);
-}
-
-/// A zero-cost recorder that discards all measurements.
-///
-/// Used as the default when no backend is configured.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoOpRecorder;
-
-impl MetricsRecorder for NoOpRecorder {
-    fn add_counter_u64(&self, _: &'static Instrument, _: u64, _: &[KeyValue]) {}
-    fn add_up_down_counter_i64(&self, _: &'static Instrument, _: i64, _: &[KeyValue]) {}
-    fn record_histogram_f64(&self, _: &'static Instrument, _: f64, _: &[KeyValue]) {}
-    fn record_gauge_i64(&self, _: &'static Instrument, _: i64, _: &[KeyValue]) {}
 }
 
 /// Instrument descriptors for the gRFC A78 XdsClient metrics emitted by this crate.

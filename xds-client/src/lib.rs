@@ -67,9 +67,7 @@ pub use client::{XdsClient, XdsClientBuilder};
 pub use codec::XdsCodec;
 pub use error::{Error, Result};
 pub use message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Locality, Node, ResourceAny};
-pub use metrics::{
-    Instrument, InstrumentKind, KeyValue, MetricsRecorder, NoOpRecorder, StringValue, Value,
-};
+pub use metrics::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 pub use resource::{DecodeResult, DecodedResource, Resource};
 pub use runtime::Runtime;
 pub use transport::{Transport, TransportBuilder, TransportStream};
