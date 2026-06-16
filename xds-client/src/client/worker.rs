@@ -535,6 +535,17 @@ pub(crate) struct AdsWorker<TB, C, R> {
     recorder: RecorderHandle,
 }
 
+/// Outcome of a connected ADS session (see [`AdsWorker::run_connected`]).
+enum ConnectedOutcome {
+    /// All `XdsClient` handles were dropped; the worker should shut down.
+    Shutdown,
+    /// The ADS stream failed; the worker should reconnect. `saw_response`
+    /// indicates whether at least one response was received before the failure
+    /// — per gRFC A78, a stream that fails after a response is not counted as a
+    /// server failure.
+    Failed { saw_response: bool },
+}
+
 impl<TB, C, R> AdsWorker<TB, C, R>
 where
     TB: TransportBuilder,
@@ -573,6 +584,11 @@ where
     /// This method runs until all `XdsClient` handles are dropped
     /// (which closes the command channel).
     pub(crate) async fn run(mut self) {
+        // gRFC A78 defines `grpc.xds_client.server_failure` as a count of xDS
+        // servers *going from healthy to unhealthy*. `healthy` mirrors the
+        // `connected` gauge so the counter (and gauge) are recorded only on that
+        // transition.
+        let mut healthy = false;
         loop {
             // Wait for at least one subscription before connecting.
             // This prevents deadlock with servers that require a message before
@@ -604,7 +620,7 @@ where
             let transport = match self.transport_builder.build(server).await {
                 Ok(t) => t,
                 Err(_) => {
-                    self.recorder.record_server_failure();
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -619,7 +635,7 @@ where
                     s
                 }
                 Err(_) => {
-                    self.recorder.record_server_failure();
+                    self.record_unhealthy(&mut healthy);
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -628,14 +644,21 @@ where
                 }
             };
 
-            self.recorder.record_connected(true);
-            let result = self.run_connected(stream).await;
-            self.recorder.record_connected(false);
+            if !healthy {
+                self.recorder.record_connected(true);
+                healthy = true;
+            }
 
-            match result {
-                Ok(()) => return, // shutdown
-                Err(_e) => {
-                    self.recorder.record_server_failure();
+            match self.run_connected(stream).await {
+                ConnectedOutcome::Shutdown => return,
+                ConnectedOutcome::Failed { saw_response } => {
+                    // gRFC A78: a server goes unhealthy (one `server_failure`) on
+                    // a connectivity failure or when the ADS stream fails
+                    // *without* seeing a response message. A stream that failed
+                    // after receiving a response is not counted; just reconnect.
+                    if !saw_response {
+                        self.record_unhealthy(&mut healthy);
+                    }
                     match self.backoff.next_backoff() {
                         Some(backoff) => self.runtime.sleep(backoff).await,
                         None => return, // Max attempts exceeded
@@ -643,6 +666,19 @@ where
                     continue;
                 }
             }
+        }
+    }
+
+    /// Record an xDS server transition to unhealthy (gRFC A78
+    /// `grpc.xds_client.server_failure`). Increments the `server_failure`
+    /// counter and drops the `connected` gauge to 0, but only on the
+    /// healthy -> unhealthy edge, so repeated reconnect attempts during a single
+    /// outage are not counted.
+    fn record_unhealthy(&self, healthy: &mut bool) {
+        if *healthy {
+            self.recorder.record_server_failure();
+            self.recorder.record_connected(false);
+            *healthy = false;
         }
     }
 
@@ -679,28 +715,38 @@ where
 
     /// Run the main event loop while connected.
     ///
-    /// Returns `Ok(())` if the worker should shut down (command channel closed).
-    /// Returns `Err` if an error occurred and the worker should reconnect.
-    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> Result<()> {
+    /// Returns [`ConnectedOutcome::Shutdown`] if the worker should shut down
+    /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
+    /// failed and the worker should reconnect (carrying whether a response was
+    /// seen, per gRFC A78).
+    async fn run_connected<S: TransportStream>(&mut self, mut stream: S) -> ConnectedOutcome {
+        // Whether at least one response was received on this stream. Per gRFC
+        // A78 a stream that fails *after* receiving a response is not counted as
+        // a server failure.
+        let mut saw_response = false;
         loop {
             tokio::select! {
                 result = stream.recv() => {
                     match result {
                         Ok(Some(bytes)) => {
-                            self.handle_response(&mut stream, bytes).await?;
+                            saw_response = true;
+                            if self.handle_response(&mut stream, bytes).await.is_err() {
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        // Stream closed by server; return Err to trigger reconnection
-                        Ok(None) => return Err(Error::StreamClosed),
-                        Err(e) => return Err(e),
+                        // Stream closed by server or errored; reconnect.
+                        Ok(None) | Err(_) => return ConnectedOutcome::Failed { saw_response },
                     }
                 }
 
                 cmd = self.command_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
-                            self.handle_command(Some(&mut stream), cmd).await?;
+                            if self.handle_command(Some(&mut stream), cmd).await.is_err() {
+                                return ConnectedOutcome::Failed { saw_response };
+                            }
                         }
-                        None => return Ok(()),
+                        None => return ConnectedOutcome::Shutdown,
                     }
                 }
             }
