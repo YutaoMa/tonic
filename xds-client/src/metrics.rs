@@ -4,10 +4,9 @@
 //! to receive metric measurements emitted by the client. Modeled after gRFC A79's
 //! `MetricsRecorder` abstraction.
 //!
-//! No bundled implementation is provided in this crate today; consumers wanting
-//! to ship metrics to a real backend must implement [`MetricsRecorder`]
-//! themselves. A bundled OpenTelemetry implementation behind an `otel` Cargo
-//! feature is planned but not yet implemented.
+//! A bundled OpenTelemetry implementation is available behind the `otel` Cargo
+//! feature (see `OtelMetricsRecorder`). Consumers that use a different telemetry
+//! framework can implement [`MetricsRecorder`] themselves.
 //!
 //! # Example
 //!
@@ -27,6 +26,9 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
+
+#[cfg(feature = "otel")]
+pub mod otel;
 
 /// Static descriptor for a metric instrument.
 ///
@@ -266,13 +268,26 @@ pub mod instruments {
 
     /// `grpc.xds_client.resources` — gauge of cached xDS resources, emitted as up-down-counter deltas.
     ///
-    /// Use `cache_state` attribute values from [`super::cache_state`].
+    /// Use `cache_state` attribute values from [`super::attrs::GRPC_XDS_CACHE_STATE`].
     pub static XDS_CLIENT_RESOURCES: Instrument = Instrument {
         name: "grpc.xds_client.resources",
         description: "Number of xDS resources currently cached, broken down by cache state.",
         unit: "{resource}",
         kind: InstrumentKind::UpDownCounter,
     };
+
+    /// Every instrument emitted by this crate.
+    ///
+    /// Backends that pre-register instruments up front (e.g. the bundled
+    /// `OtelMetricsRecorder`) iterate this slice at construction time instead of
+    /// creating instruments lazily on the recording path.
+    pub static ALL: &[&Instrument] = &[
+        &XDS_CLIENT_CONNECTED,
+        &XDS_CLIENT_SERVER_FAILURE,
+        &XDS_CLIENT_RESOURCE_UPDATES_VALID,
+        &XDS_CLIENT_RESOURCE_UPDATES_INVALID,
+        &XDS_CLIENT_RESOURCES,
+    ];
 }
 
 /// Attribute keys used by the gRFC A78 XdsClient metrics.

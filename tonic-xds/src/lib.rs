@@ -150,5 +150,10 @@ pub use client::channel::{
 pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
 pub use xds::uri::{XdsUri, XdsUriError};
 
+pub use xds_client::MetricsRecorder;
+
+#[cfg(feature = "otel")]
+pub use xds_client::OtelMetricsRecorder;
+
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil;

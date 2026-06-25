@@ -53,6 +53,7 @@ tonic-prost = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 x509-parser = { version = "0.17", optional = true }
+opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["metrics"] }
 
 [lints]
 workspace = true
@@ -69,6 +70,9 @@ rcgen = "0.14"
 
 [features]
 testutil = ["dep:tonic-prost"]
+
+# Bundled OpenTelemetry metrics recorder for the gRFC A78 xDS client metrics.
+otel = ["dep:opentelemetry", "xds-client/otel"]
 
 # TLS crypto backend — pick exactly one.
 _tls-any = ["dep:rustls", "dep:rustls-pemfile", "dep:x509-parser"]
