@@ -424,6 +424,7 @@ mod tests {
             Box::pin(async move {
                 Ok(RouteDecision {
                     cluster: "test-cluster".to_string(),
+                    request_hash: None,
                 })
             })
         }
