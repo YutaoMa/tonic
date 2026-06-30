@@ -26,9 +26,6 @@ http = { version = "1", optional = true }
 envoy-types = { version = "0.7", optional = true }
 prost = { version = "0.14", optional = true }
 
-# Optional dependency for the bundled OpenTelemetry metrics recorder
-opentelemetry = { version = "0.32", optional = true, default-features = false, features = ["metrics"] }
-
 [features]
 default = ["transport-tonic", "codegen-prost"]
 transport-tonic = [
@@ -41,7 +38,6 @@ tonic-tls-ring = ["transport-tonic", "tonic/tls-ring"]
 tonic-tls-aws-lc = ["transport-tonic", "tonic/tls-aws-lc"]
 rt-tokio = ["tokio/rt", "tokio/time"]
 codegen-prost = ["dep:envoy-types", "dep:prost"]
-otel = ["dep:opentelemetry"]
 test-util = []
 
 [dev-dependencies]
@@ -64,6 +60,4 @@ required-features = ["tonic-tls-ring"]
 allowed_external_types = [
     # major released
     "bytes::*",
-    # exposed only with the `otel` feature (OtelMetricsRecorder::new)
-    "opentelemetry::*",
 ]

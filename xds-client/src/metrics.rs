@@ -4,9 +4,9 @@
 //! to receive metric measurements emitted by the client. Modeled after gRFC A79's
 //! `MetricsRecorder` abstraction.
 //!
-//! A bundled OpenTelemetry implementation is available behind the `otel` Cargo
-//! feature (see `OtelMetricsRecorder`). Consumers that use a different telemetry
-//! framework can implement [`MetricsRecorder`] themselves.
+//! A bundled OpenTelemetry implementation is available in the companion
+//! `xds-client-opentelemetry` crate (`OtelMetricsRecorder`). Consumers that use
+//! a different telemetry framework can implement [`MetricsRecorder`] themselves.
 //!
 //! # Example
 //!
@@ -26,9 +26,6 @@
 use std::borrow::Cow;
 use std::fmt;
 use std::sync::Arc;
-
-#[cfg(feature = "otel")]
-pub mod otel;
 
 /// Static descriptor for a metric instrument.
 ///
@@ -52,8 +49,7 @@ pub struct Instrument {
 pub enum InstrumentKind {
     /// Monotonic `u64` counter.
     Counter,
-    /// Bidirectional `i64` counter, used for gauges emitted as deltas
-    /// (e.g. `grpc.xds_client.resources`).
+    /// Bidirectional `i64` counter for values that can increase or decrease.
     UpDownCounter,
     /// Distribution of `f64` values.
     Histogram,
@@ -266,14 +262,17 @@ pub mod instruments {
         kind: InstrumentKind::Counter,
     };
 
-    /// `grpc.xds_client.resources` — gauge of cached xDS resources, emitted as up-down-counter deltas.
+    /// `grpc.xds_client.resources` — gauge of cached xDS resources, broken down by cache state.
     ///
-    /// Use `cache_state` attribute values from [`super::attrs::GRPC_XDS_CACHE_STATE`].
+    /// Emitted via [`record_gauge_i64`](super::MetricsRecorder::record_gauge_i64)
+    /// as the current absolute count for each `(resource_type, cache_state)`
+    /// bucket. Use `cache_state` attribute values from
+    /// [`super::attrs::GRPC_XDS_CACHE_STATE`].
     pub static XDS_CLIENT_RESOURCES: Instrument = Instrument {
         name: "grpc.xds_client.resources",
         description: "Number of xDS resources currently cached, broken down by cache state.",
         unit: "{resource}",
-        kind: InstrumentKind::UpDownCounter,
+        kind: InstrumentKind::Gauge,
     };
 
     /// Every instrument emitted by this crate.

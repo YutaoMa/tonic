@@ -50,7 +50,6 @@
 //! - `transport-tonic`: Enables the use of the `tonic` transport. This enables `rt-tokio` and `codegen-prost` features. Enabled by default.
 //! - `rt-tokio`: Enables the use of the `tokio` runtime. Enabled by default.
 //! - `codegen-prost`: Enables the use of the `prost` codec generated resources. Enabled by default.
-//! - `otel`: Enables `OtelMetricsRecorder`, a bundled [`MetricsRecorder`] that forwards measurements to an OpenTelemetry `Meter`. Disabled by default.
 
 pub mod client;
 pub mod codec;
@@ -70,8 +69,6 @@ pub use error::{Error, Result};
 pub use message::{DiscoveryRequest, DiscoveryResponse, ErrorDetail, Locality, Node, ResourceAny};
 pub use metrics::{Instrument, InstrumentKind, KeyValue, MetricsRecorder, StringValue, Value};
 
-#[cfg(feature = "otel")]
-pub use metrics::otel::OtelMetricsRecorder;
 pub use resource::{DecodeResult, DecodedResource, Resource};
 pub use runtime::Runtime;
 pub use transport::{Transport, TransportBuilder, TransportStream};
