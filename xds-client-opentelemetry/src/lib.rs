@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn exports_resources_as_gauge_and_counter_as_sum() {
         use opentelemetry::metrics::MeterProvider as _;
-        use opentelemetry_sdk::metrics::SdkMeterProvider;
         use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+        use opentelemetry_sdk::metrics::SdkMeterProvider;
         use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 
         let exporter = InMemoryMetricExporter::default();
@@ -278,7 +278,10 @@ mod tests {
         // The A78 counter is exported as a monotonic Sum carrying the value.
         let failures = metric_named("grpc.xds_client.server_failure");
         let AggregatedMetrics::U64(MetricData::Sum(sum)) = failures.data() else {
-            panic!("server_failure must be a u64 Sum, got {:?}", failures.data());
+            panic!(
+                "server_failure must be a u64 Sum, got {:?}",
+                failures.data()
+            );
         };
         assert!(sum.is_monotonic(), "counter must export as a monotonic Sum");
         let sum_points: Vec<_> = sum.data_points().collect();

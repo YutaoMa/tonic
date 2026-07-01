@@ -165,7 +165,10 @@ impl RecorderHandle {
         let Some(recorder) = &self.recorder else {
             return;
         };
-        let last = self.resource_counts.entry(Arc::clone(type_url)).or_default();
+        let last = self
+            .resource_counts
+            .entry(Arc::clone(type_url))
+            .or_default();
 
         // New or changed buckets.
         for (&state, &count) in counts {

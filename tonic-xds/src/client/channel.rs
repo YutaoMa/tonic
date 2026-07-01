@@ -205,9 +205,9 @@ impl XdsChannelBuilder {
     #[cfg(feature = "otel")]
     #[must_use]
     pub fn with_otel_metrics(self, meter: opentelemetry::metrics::Meter) -> Self {
-        self.with_metrics_recorder(Arc::new(xds_client_opentelemetry::OtelMetricsRecorder::new(
-            meter,
-        )))
+        self.with_metrics_recorder(Arc::new(
+            xds_client_opentelemetry::OtelMetricsRecorder::new(meter),
+        ))
     }
 
     fn build_tonic_grpc_channel(&self) -> Result<XdsChannelGrpc, BuildError> {
