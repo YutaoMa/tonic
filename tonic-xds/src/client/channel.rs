@@ -167,8 +167,8 @@ impl Debug for XdsChannelBuilder {
                 "recorder",
                 &self
                     .recorder
-                    .as_ref()
-                    .map_or("None", |_| "Some(Arc<dyn MetricsRecorder>)"),
+                    .as_deref()
+                    .map_or("None", |r| std::any::type_name_of_val(r)),
             )
             .finish()
     }
