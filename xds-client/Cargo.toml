@@ -7,7 +7,7 @@ homepage = "https://github.com/hyperium/tonic"
 repository = "https://github.com/hyperium/tonic"
 license = "MIT"
 rust-version = { workspace = true }
-publish = false
+publish = true
 
 [lints]
 workspace = true
