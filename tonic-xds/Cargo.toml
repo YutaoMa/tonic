@@ -99,3 +99,25 @@ required-features = ["testutil"]
 
 [[example]]
 name = "xds_server"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    "tonic::*",
+    "xds_client::*",
+
+    # major released
+    "bytes::*",
+    "http::*",
+    "http_body::*",
+
+    # not major released
+    "prost::*",
+    "opentelemetry::*",
+
+    "tower_service::Service",
+    "tower::BoxError",
+    "tower::util::boxed_clone_sync::BoxCloneSyncService",
+    "url::parser::ParseError",
+    "serde_core::de::Deserialize",
+    "serde_json::error::Error",
+]
