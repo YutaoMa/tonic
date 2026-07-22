@@ -369,11 +369,10 @@ mod tests {
         // Config carries filter_metadata that the interceptor is expected to see.
         let mut filter_metadata = std::collections::HashMap::new();
         filter_metadata.insert("partitioning".to_string(), Struct::default());
-        let metadata = Metadata {
+        let metadata = RouteConfigMetadata::from_proto(Metadata {
             filter_metadata,
             ..Default::default()
-        }
-        .into();
+        });
 
         let rc = Arc::new(RouteConfigResource {
             name: "rc".into(),

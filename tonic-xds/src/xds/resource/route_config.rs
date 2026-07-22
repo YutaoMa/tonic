@@ -7,7 +7,6 @@ use envoy_types::pb::envoy::config::core::v3::Metadata;
 use envoy_types::pb::envoy::config::route::v3::{
     RouteConfiguration, RouteMatch, route, route_action, route_match,
 };
-use envoy_types::pb::google::protobuf::Struct;
 use prost::Message;
 use regex::Regex;
 use xds_client::resource::TypeUrl;
@@ -18,23 +17,29 @@ use super::string_matcher::StringMatcher;
 /// Read-only view over an xDS resource's `metadata.filter_metadata`
 /// (see [`envoy.config.core.v3.Metadata`]).
 ///
-/// Exposes the untyped `google.protobuf.Struct` config keyed by
-/// `filter_metadata` namespace.
+/// Each `filter_metadata` namespace carries a `google.protobuf.Struct`; this
+/// exposes it as the **encoded protobuf bytes** (keyed by namespace) so
+/// consumers can decode it with their own prost message — for example a
+/// `Struct`, or a typed config proto that shares its wire format.
+///
 /// This is the spec-native carrier for extensions that ride on standard xDS
-/// `metadata`, surfaced so that a pre-route interceptor (or other consumer)
-/// can read config that was attached to the `RouteConfiguration`.
+/// `metadata`, surfaced so that a pre-route interceptor (or other consumer) can
+/// read config attached to the `RouteConfiguration`.
 ///
 /// [`envoy.config.core.v3.Metadata`]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/core/v3/base.proto#envoy-v3-api-msg-config-core-v3-metadata
 #[derive(Debug, Clone, Default)]
 pub struct RouteConfigMetadata {
-    filter_metadata: HashMap<String, Struct>,
+    /// Encoded `google.protobuf.Struct` bytes, keyed by `filter_metadata` namespace.
+    filter_metadata: HashMap<String, Bytes>,
 }
 
 impl RouteConfigMetadata {
-    /// Returns the untyped `filter_metadata` [`Struct`] for `namespace`, if present.
+    /// Returns the encoded `google.protobuf.Struct` for the `filter_metadata`
+    /// `namespace`, if present. Decode it with a prost message (for example a
+    /// `Struct`, or a typed config proto sharing its wire format).
     #[must_use]
-    pub fn filter_metadata(&self, namespace: &str) -> Option<&Struct> {
-        self.filter_metadata.get(namespace)
+    pub fn filter_metadata(&self, namespace: &str) -> Option<Bytes> {
+        self.filter_metadata.get(namespace).cloned()
     }
 
     /// Returns `true` when no `filter_metadata` namespaces are present.
@@ -42,13 +47,16 @@ impl RouteConfigMetadata {
     pub fn is_empty(&self) -> bool {
         self.filter_metadata.is_empty()
     }
-}
 
-impl From<Metadata> for RouteConfigMetadata {
-    fn from(metadata: Metadata) -> Self {
-        Self {
-            filter_metadata: metadata.filter_metadata,
-        }
+    /// Builds the view from an xDS `Metadata`, pre-encoding each namespace's
+    /// `Struct` to bytes.
+    pub(crate) fn from_proto(metadata: Metadata) -> Self {
+        let filter_metadata = metadata
+            .filter_metadata
+            .into_iter()
+            .map(|(namespace, value)| (namespace, Bytes::from(value.encode_to_vec())))
+            .collect();
+        Self { filter_metadata }
     }
 }
 
@@ -158,7 +166,7 @@ impl Resource for RouteConfigResource {
         let name = message.name;
         let metadata = message
             .metadata
-            .map(RouteConfigMetadata::from)
+            .map(RouteConfigMetadata::from_proto)
             .unwrap_or_default();
 
         if message.virtual_hosts.is_empty() {
