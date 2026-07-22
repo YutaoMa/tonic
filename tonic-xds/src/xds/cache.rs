@@ -186,6 +186,7 @@ mod tests {
                     action: RouteConfigAction::Cluster("cluster-1".to_string()),
                 }],
             }],
+            metadata: Default::default(),
         })
     }
 

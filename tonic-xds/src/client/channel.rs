@@ -1,14 +1,16 @@
 use crate::client::cluster::ClusterClientRegistryGrpc;
 use crate::client::endpoint::{EndpointAddress, EndpointChannel};
 use crate::client::lb::{ClusterDiscovery, XdsLbService};
-use crate::client::route::{Router, XdsRoutingLayer};
+use crate::client::route::{
+    PreRouteInterceptor, PreRouteLayer, RouteConfigSelectorLayer, Router, XdsRoutingLayer,
+};
 use crate::xds::bootstrap::{BootstrapConfig, BootstrapError};
 use crate::xds::cache::XdsCache;
 #[cfg(feature = "_tls-any")]
 use crate::xds::cert_provider::{CertProviderError, CertProviderRegistry, CertificateProvider};
 use crate::xds::cluster_discovery::XdsClusterDiscovery;
 use crate::xds::resource_manager::XdsResourceManager;
-use crate::xds::routing::XdsRouter;
+use crate::xds::routing::{RouteConfigWatcher, XdsRouter};
 use crate::{TonicCallCredentials, XdsUri};
 use http::Request;
 #[cfg(feature = "_tls-any")]
@@ -170,6 +172,7 @@ const _: fn() = || {
 pub struct XdsChannelBuilder {
     config: Arc<XdsChannelConfig>,
     recorder: Option<Arc<dyn MetricsRecorder>>,
+    pre_route: Option<Arc<dyn PreRouteInterceptor>>,
     #[cfg(feature = "_tls-any")]
     cert_providers: HashMap<String, Arc<dyn CertificateProvider>>,
 }
@@ -177,13 +180,21 @@ pub struct XdsChannelBuilder {
 impl Debug for XdsChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = f.debug_struct("XdsChannelBuilder");
-        s.field("config", &self.config).field(
-            "recorder",
-            &self
-                .recorder
-                .as_deref()
-                .map_or("None", |r| std::any::type_name_of_val(r)),
-        );
+        s.field("config", &self.config)
+            .field(
+                "recorder",
+                &self
+                    .recorder
+                    .as_deref()
+                    .map_or("None", |r| std::any::type_name_of_val(r)),
+            )
+            .field(
+                "pre_route",
+                &self
+                    .pre_route
+                    .as_deref()
+                    .map_or("None", |i| std::any::type_name_of_val(i)),
+            );
         #[cfg(feature = "_tls-any")]
         s.field(
             "cert_providers",
@@ -200,6 +211,7 @@ impl XdsChannelBuilder {
         Self {
             config: Arc::new(config),
             recorder: None,
+            pre_route: None,
             #[cfg(feature = "_tls-any")]
             cert_providers: HashMap::new(),
         }
@@ -214,6 +226,22 @@ impl XdsChannelBuilder {
     #[must_use]
     pub fn with_metrics_recorder(mut self, recorder: Arc<dyn MetricsRecorder>) -> Self {
         self.recorder = Some(recorder);
+        self
+    }
+
+    /// Registers a [`PreRouteInterceptor`] that runs before route selection.
+    ///
+    /// The channel binds the active `RouteConfiguration` to each request
+    /// in the route-config selector stage. When an interceptor is registered, it
+    /// runs between that selector stage and the router: it may mutate request
+    /// headers (using the config's
+    /// [`RouteConfigMetadata`](crate::RouteConfigMetadata)) before the router
+    /// matches on them, against that same config snapshot. This enables
+    /// config-driven request transformation such as computing a partition/shard
+    /// key and injecting a routing header.
+    #[must_use]
+    pub fn with_pre_route_interceptor(mut self, interceptor: Arc<dyn PreRouteInterceptor>) -> Self {
+        self.pre_route = Some(interceptor);
         self
     }
 
@@ -317,15 +345,17 @@ impl XdsChannelBuilder {
         xds_client: XdsClient,
         resource_manager: XdsResourceManager,
     ) -> XdsChannelGrpc {
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache, cert_provider_registry));
+        > = Arc::new(XdsClusterDiscovery::new(
+            cache.clone(),
+            cert_provider_registry,
+        ));
         #[cfg(not(feature = "_tls-any"))]
         let discovery: Arc<
             dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>,
-        > = Arc::new(XdsClusterDiscovery::new(cache));
+        > = Arc::new(XdsClusterDiscovery::new(cache.clone()));
         let retry_policy = GrpcRetryPolicy::new(GrpcRetryPolicyConfig::default());
 
         let resources = Arc::new(XdsChannelResources {
@@ -333,18 +363,21 @@ impl XdsChannelBuilder {
             _xds_client: xds_client,
         });
 
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
+
+        let watcher = Arc::new(RouteConfigWatcher::new(&cache));
+        let router: Arc<dyn Router> = Arc::new(XdsRouter);
         let inner = ServiceBuilder::new()
-            .layer(routing_layer)
+            .layer(RouteConfigSelectorLayer::new(watcher))
+            .option_layer(self.pre_route.clone().map(PreRouteLayer::new))
+            .layer(XdsRoutingLayer::new(router, self.authority()))
             .layer(retry_layer)
             .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
                 req.map(TonicBody::new)
             })
             .service(lb_service);
-
         BoxCloneSyncService::new(XdsChannel {
             config: self.config.clone(),
             inner,
@@ -359,20 +392,24 @@ impl XdsChannelBuilder {
         self.build_tonic_grpc_channel()
     }
 
-    /// Builds an `XdsChannelGrpc` from the given router, cluster discovery, and retry policy.
+    /// Builds an `XdsChannelGrpc` from the given parts, mirroring the production
+    /// stack, used for tests.
     #[cfg(test)]
     pub(crate) fn build_grpc_channel_from_parts(
         &self,
+        watcher: Arc<RouteConfigWatcher>,
         router: Arc<dyn Router>,
         discovery: Arc<dyn ClusterDiscovery<EndpointAddress, EndpointChannel<Channel>>>,
         retry_policy: GrpcRetryPolicy,
+        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     ) -> XdsChannelGrpc {
-        let routing_layer = XdsRoutingLayer::new(router, self.authority());
         let retry_layer = RetryLayer::new(retry_policy);
         let cluster_registry = Arc::new(ClusterClientRegistryGrpc::new());
         let lb_service = XdsLbService::new(cluster_registry, discovery);
         let inner = ServiceBuilder::new()
-            .layer(routing_layer)
+            .layer(RouteConfigSelectorLayer::new(watcher))
+            .option_layer(interceptor.map(PreRouteLayer::new))
+            .layer(XdsRoutingLayer::new(router, self.authority()))
             .layer(retry_layer)
             .map_request(|req: Request<shared_http_body::SharedBody<TonicBody>>| {
                 req.map(TonicBody::new)
@@ -415,6 +452,7 @@ mod tests {
     use crate::xds::cache::XdsCache;
     use crate::xds::resource::EndpointsResource;
     use crate::xds::resource::route_config::RouteConfigResource;
+    use crate::xds::routing::RouteConfigWatcher;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tonic::transport::Channel;
@@ -549,11 +587,14 @@ mod tests {
         // Create a mock XdsManager with the test servers
         let xds_manager = Arc::new(MockXdsManager::from_test_servers(&servers));
 
+        let (_cache, watcher) = mock_ready_watcher();
         let xds_channel_builder = XdsChannelBuilder::new(test_config());
         let xds_channel = xds_channel_builder.build_grpc_channel_from_parts(
+            watcher,
             xds_manager.clone(),
             xds_manager.clone(),
             GrpcRetryPolicy::default(),
+            None,
         );
 
         let client = GreeterClient::new(xds_channel);
@@ -627,10 +668,13 @@ mod tests {
                 .num_retries(1),
         );
 
+        let (_cache, watcher) = mock_ready_watcher();
         let xds_channel = XdsChannelBuilder::new(test_config()).build_grpc_channel_from_parts(
+            watcher,
             xds_manager.clone(),
             xds_manager.clone(),
             retry_policy,
+            None,
         );
 
         let mut client = GreeterClient::new(xds_channel);
@@ -677,7 +721,19 @@ mod tests {
                     action: RouteConfigAction::Cluster(cluster_name.to_string()),
                 }],
             }],
+            metadata: Default::default(),
         })
+    }
+
+    /// Helper: a [`RouteConfigWatcher`] fed by a cache with a published route
+    /// config, so the selector layer becomes ready. Returns the cache
+    /// too so callers can keep it alive for the duration of the test. Used by
+    /// mock-router tests whose router ignores the bound config.
+    fn mock_ready_watcher() -> (Arc<XdsCache>, Arc<RouteConfigWatcher>) {
+        let cache = Arc::new(XdsCache::new());
+        cache.update_route_config(make_test_route_config("test-cluster"));
+        let watcher = Arc::new(RouteConfigWatcher::new(&cache));
+        (cache, watcher)
     }
 
     /// Helper: creates an `EndpointsResource` from test server addresses.
@@ -708,7 +764,8 @@ mod tests {
         use crate::xds::cluster_discovery::XdsClusterDiscovery;
         use crate::xds::routing::XdsRouter;
 
-        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
+        let router: Arc<dyn Router> = Arc::new(XdsRouter);
+        let watcher = Arc::new(RouteConfigWatcher::new(&cache));
 
         #[cfg(feature = "_tls-any")]
         let discovery: Arc<
@@ -727,7 +784,13 @@ mod tests {
         > = Arc::new(XdsClusterDiscovery::new(cache));
 
         let builder = XdsChannelBuilder::new(test_config());
-        builder.build_grpc_channel_from_parts(router, discovery, GrpcRetryPolicy::default())
+        builder.build_grpc_channel_from_parts(
+            watcher,
+            router,
+            discovery,
+            GrpcRetryPolicy::default(),
+            None,
+        )
     }
 
     /// Tests the full xDS stack (XdsRouter + XdsClusterDiscovery) with a

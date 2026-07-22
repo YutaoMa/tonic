@@ -147,7 +147,9 @@ pub(crate) mod xds;
 pub use client::channel::{
     BuildError, XdsChannel, XdsChannelBuilder, XdsChannelConfig, XdsChannelGrpc,
 };
+pub use client::route::PreRouteInterceptor;
 pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
+pub use xds::resource::route_config::RouteConfigMetadata;
 pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
 

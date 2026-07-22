@@ -1,11 +1,13 @@
 //! Validated RouteConfiguration resource (RDS).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
+use envoy_types::pb::envoy::config::core::v3::Metadata;
 use envoy_types::pb::envoy::config::route::v3::{
     RouteConfiguration, RouteMatch, route, route_action, route_match,
 };
+use envoy_types::pb::google::protobuf::Struct;
 use prost::Message;
 use regex::Regex;
 use xds_client::resource::TypeUrl;
@@ -13,11 +15,51 @@ use xds_client::{Error, Resource};
 
 use super::string_matcher::StringMatcher;
 
+/// Read-only view over an xDS resource's `metadata.filter_metadata`
+/// (see [`envoy.config.core.v3.Metadata`]).
+///
+/// Exposes the untyped `google.protobuf.Struct` config keyed by
+/// `filter_metadata` namespace.
+/// This is the spec-native carrier for extensions that ride on standard xDS
+/// `metadata`, surfaced so that a pre-route interceptor (or other consumer)
+/// can read config that was attached to the `RouteConfiguration`.
+///
+/// [`envoy.config.core.v3.Metadata`]: https://www.envoyproxy.io/docs/envoy/latest/api-v3/config/core/v3/base.proto#envoy-v3-api-msg-config-core-v3-metadata
+#[derive(Debug, Clone, Default)]
+pub struct RouteConfigMetadata {
+    filter_metadata: HashMap<String, Struct>,
+}
+
+impl RouteConfigMetadata {
+    /// Returns the untyped `filter_metadata` [`Struct`] for `namespace`, if present.
+    #[must_use]
+    pub fn filter_metadata(&self, namespace: &str) -> Option<&Struct> {
+        self.filter_metadata.get(namespace)
+    }
+
+    /// Returns `true` when no `filter_metadata` namespaces are present.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.filter_metadata.is_empty()
+    }
+}
+
+impl From<Metadata> for RouteConfigMetadata {
+    fn from(metadata: Metadata) -> Self {
+        Self {
+            filter_metadata: metadata.filter_metadata,
+        }
+    }
+}
+
 /// Validated RouteConfiguration.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteConfigResource {
     pub name: String,
     pub virtual_hosts: Vec<VirtualHostConfig>,
+    /// Resource-level `metadata` (`filter_metadata`), surfaced for pre-route
+    /// interceptors. Empty when the `RouteConfiguration` carried no metadata.
+    pub metadata: RouteConfigMetadata,
 }
 
 /// Validated virtual host with domain matching and routes.
@@ -114,6 +156,10 @@ impl Resource for RouteConfigResource {
 
     fn validate(message: Self::Message) -> xds_client::Result<Self> {
         let name = message.name;
+        let metadata = message
+            .metadata
+            .map(RouteConfigMetadata::from)
+            .unwrap_or_default();
 
         if message.virtual_hosts.is_empty() {
             return Err(Error::Validation(format!(
@@ -148,6 +194,7 @@ impl Resource for RouteConfigResource {
         Ok(RouteConfigResource {
             name,
             virtual_hosts,
+            metadata,
         })
     }
 }
