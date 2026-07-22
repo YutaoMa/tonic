@@ -1,6 +1,6 @@
 use crate::common::async_util::BoxFuture;
-use crate::xds::resource::route_config::{RouteConfigMetadata, RouteConfigResource};
-use crate::xds::routing::{RouteConfigWatcher, RoutingError};
+use crate::xds::resource::route_config::RouteConfigMetadata;
+use crate::xds::routing::RoutingError;
 use http::Request;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -13,12 +13,6 @@ pub(crate) struct RouteInput<'a> {
     pub authority: &'a str,
     /// The HTTP headers of the request. These can be used for header-based routing decisions.
     pub headers: &'a http::HeaderMap,
-    /// Route configuration already bound to this request by an upstream
-    /// [`RouteConfigSelectorService`]. When `Some`, the router matches against
-    /// it directly (the single-pass path shared with a pre-route interceptor);
-    /// when `None`, routing fails with `RoutingError::NotReady` (the selector
-    /// layer always sets it in the assembled channel stack).
-    pub config: Option<&'a RouteConfigResource>,
 }
 
 /// Represents the routing decision made by the routing layer.
@@ -34,30 +28,15 @@ pub(crate) struct RouteDecision {
     pub request_hash: Option<u64>,
 }
 
-/// Marker stored in request extensions carrying the [`RouteConfigResource`]
-/// bound to a request by [`RouteConfigSelectorService`].
+/// A hook that runs before xDS route selection.
 ///
-/// Binding the config once and sharing it via extensions guarantees that a
-/// [`PreRouteInterceptor`] and the router observe the *same* route-config
-/// version for a given request, even if an xDS update lands mid-request.
-#[derive(Clone)]
-pub(crate) struct ActiveRouteConfig(pub(crate) Arc<RouteConfigResource>);
-
-/// A hook that runs **before** xDS route selection.
-///
-/// The interceptor may inspect and mutate the request headers using the
-/// [`RouteConfigMetadata`] attached to the active `RouteConfiguration`. Because
-/// it runs before routing, any header mutation it makes is visible to route
-/// matching — enabling config-driven request transformation, such as computing
-/// a partition/shard key and injecting a routing header that the standard
-/// header-match router then selects on.
-///
-/// The hook deliberately cannot return a routing decision: it influences routing
-/// only by mutating the request, after which the standard xDS router runs once.
-/// This keeps the routing model itself unchanged and single-pass.
+/// The interceptor may mutate the request headers using the route
+/// configuration's [`RouteConfigMetadata`]. Because it runs before routing, its
+/// mutations are visible to route matching — enabling config-driven request
+/// transformation (e.g. computing a partition/shard key and injecting a routing
+/// header the router then matches on). It cannot otherwise influence routing.
 pub trait PreRouteInterceptor: Send + Sync + 'static {
-    /// Inspects and optionally mutates `headers` using the active route-config
-    /// `metadata`. Runs before route selection.
+    /// Inspects and optionally mutates `headers` using the route-config `metadata`.
     fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata);
 }
 
@@ -68,6 +47,12 @@ pub trait PreRouteInterceptor: Send + Sync + 'static {
 /// [`XdsRouter`](crate::xds::routing::XdsRouter).
 pub(crate) trait Router: Send + Sync + 'static {
     fn route(&self, input: &RouteInput<'_>) -> BoxFuture<Result<RouteDecision, RoutingError>>;
+
+    /// Current route-config metadata, if available, used to feed a
+    /// [`PreRouteInterceptor`]. Defaults to `None` (e.g. for mock routers).
+    fn metadata(&self) -> Option<RouteConfigMetadata> {
+        None
+    }
 }
 
 /// Tower service for routing requests to the appropriate cluster.
@@ -80,6 +65,8 @@ pub(crate) struct XdsRoutingService<S> {
     inner: S,
     /// The router used to make routing decisions based on the request.
     router: Arc<dyn Router>,
+    /// Optional hook run before routing; may mutate request headers.
+    interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     /// Channel-level authority used as the routing key.
     authority: Arc<str>,
 }
@@ -100,19 +87,21 @@ where
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
         let router = self.router.clone();
+        let interceptor = self.interceptor.clone();
         let authority = self.authority.clone();
         let mut inner_service = self.inner.clone();
         Box::pin(async move {
-            let active = request.extensions().get::<ActiveRouteConfig>().cloned();
-            let route_future = {
-                let route_input = RouteInput {
-                    authority: &authority,
-                    headers: request.headers(),
-                    config: active.as_ref().map(|a| a.0.as_ref()),
-                };
-                router.route(&route_input)
+            if let Some(interceptor) = interceptor.as_ref()
+                && let Some(metadata) = router.metadata()
+            {
+                interceptor.on_request(request.headers_mut(), &metadata);
+            }
+            let headers = &request.headers();
+            let route_input = RouteInput {
+                authority: &authority,
+                headers,
             };
-            let route_decision = route_future.await?;
+            let route_decision = router.route(&route_input).await?;
             request.extensions_mut().insert(route_decision);
             inner_service.call(request).await.map_err(Into::into)
         })
@@ -124,17 +113,27 @@ where
 #[allow(dead_code)]
 pub(crate) struct XdsRoutingLayer {
     router: Arc<dyn Router>,
+    interceptor: Option<Arc<dyn PreRouteInterceptor>>,
     authority: Arc<str>,
 }
 
 impl XdsRoutingLayer {
-    /// Creates a new `XdsRoutingLayer` with the given [`Router`] and authority.
+    /// Creates a new `XdsRoutingLayer` with the given [`Router`], optional
+    /// pre-route interceptor, and authority.
     ///
     /// `authority` is the routing key matched against `VirtualHost.domains`
     /// in RDS. It should be the endpoint portion of the xDS target.
     #[allow(dead_code)]
-    pub(crate) fn new(router: Arc<dyn Router>, authority: Arc<str>) -> Self {
-        Self { router, authority }
+    pub(crate) fn new(
+        router: Arc<dyn Router>,
+        interceptor: Option<Arc<dyn PreRouteInterceptor>>,
+        authority: Arc<str>,
+    ) -> Self {
+        Self {
+            router,
+            interceptor,
+            authority,
+        }
     }
 }
 
@@ -145,126 +144,8 @@ impl<S> Layer<S> for XdsRoutingLayer {
         XdsRoutingService {
             inner: service,
             router: self.router.clone(),
-            authority: self.authority.clone(),
-        }
-    }
-}
-
-/// Tower service that snapshots the active route configuration once and binds it
-/// to the request as [`ActiveRouteConfig`], before any pre-route interceptor or
-/// the router runs.
-///
-/// It also owns A57 initial-resource readiness: the first request blocks here
-/// until route config is available, after which the stateless router and
-/// any interceptor share this single snapshot.
-#[derive(Clone)]
-pub(crate) struct RouteConfigSelectorService<S> {
-    inner: S,
-    watcher: Arc<RouteConfigWatcher>,
-}
-
-impl<S, B> Service<Request<B>> for RouteConfigSelectorService<S>
-where
-    S: Service<Request<B>, Error: Into<BoxError>> + Clone + Send + 'static,
-    B: Send + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = BoxError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        let watcher = self.watcher.clone();
-        let mut inner = self.inner.clone();
-        Box::pin(async move {
-            let config = watcher.snapshot().await?;
-            request.extensions_mut().insert(ActiveRouteConfig(config));
-            inner.call(request).await.map_err(Into::into)
-        })
-    }
-}
-
-/// Layer producing a [`RouteConfigSelectorService`].
-#[derive(Clone)]
-pub(crate) struct RouteConfigSelectorLayer {
-    watcher: Arc<RouteConfigWatcher>,
-}
-
-impl RouteConfigSelectorLayer {
-    pub(crate) fn new(watcher: Arc<RouteConfigWatcher>) -> Self {
-        Self { watcher }
-    }
-}
-
-impl<S> Layer<S> for RouteConfigSelectorLayer {
-    type Service = RouteConfigSelectorService<S>;
-
-    fn layer(&self, service: S) -> Self::Service {
-        RouteConfigSelectorService {
-            inner: service,
-            watcher: self.watcher.clone(),
-        }
-    }
-}
-
-/// Tower service that runs a [`PreRouteInterceptor`] before routing.
-///
-/// Reads the [`ActiveRouteConfig`] bound upstream and lets the interceptor
-/// mutate request headers using its metadata; the mutated headers are then seen
-/// by the router in the same pass.
-#[derive(Clone)]
-pub(crate) struct PreRouteService<S> {
-    inner: S,
-    interceptor: Arc<dyn PreRouteInterceptor>,
-}
-
-impl<S, B> Service<Request<B>> for PreRouteService<S>
-where
-    S: Service<Request<B>, Error: Into<BoxError>> + Clone + Send + 'static,
-    B: Send + 'static,
-    S::Future: Send + 'static,
-{
-    type Response = S::Response;
-    type Error = BoxError;
-    type Future = BoxFuture<Result<Self::Response, Self::Error>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        if let Some(active) = request.extensions().get::<ActiveRouteConfig>().cloned() {
-            self.interceptor
-                .on_request(request.headers_mut(), &active.0.metadata);
-        }
-        let mut inner = self.inner.clone();
-        Box::pin(async move { inner.call(request).await.map_err(Into::into) })
-    }
-}
-
-/// Layer producing a [`PreRouteService`].
-#[derive(Clone)]
-pub(crate) struct PreRouteLayer {
-    interceptor: Arc<dyn PreRouteInterceptor>,
-}
-
-impl PreRouteLayer {
-    pub(crate) fn new(interceptor: Arc<dyn PreRouteInterceptor>) -> Self {
-        Self { interceptor }
-    }
-}
-
-impl<S> Layer<S> for PreRouteLayer {
-    type Service = PreRouteService<S>;
-
-    fn layer(&self, service: S) -> Self::Service {
-        PreRouteService {
-            inner: service,
             interceptor: self.interceptor.clone(),
+            authority: self.authority.clone(),
         }
     }
 }
@@ -301,7 +182,7 @@ mod tests {
         let router: Arc<dyn Router> = Arc::new(CaptureAuthorityRouter {
             captured: captured.clone(),
         });
-        let layer = XdsRoutingLayer::new(router, Arc::from("greeter.svc:50051"));
+        let layer = XdsRoutingLayer::new(router, None, Arc::from("greeter.svc:50051"));
 
         let inner =
             service_fn(
@@ -335,6 +216,8 @@ mod tests {
         );
     }
 
+    /// End-to-end check of the pre-route seam: the interceptor reads route-config
+    /// metadata and injects a partition header, which the router then matches.
     #[tokio::test]
     async fn pre_route_interceptor_drives_partition_selection() {
         use crate::xds::cache::XdsCache;
@@ -344,9 +227,8 @@ mod tests {
         };
         use crate::xds::routing::XdsRouter;
         use envoy_types::pb::envoy::config::core::v3::Metadata;
-        use envoy_types::pb::google::protobuf::Struct;
+        use envoy_types::pb::google::protobuf::{Any, Struct};
 
-        // Route table: x-partition N -> cluster-pN, matched via integer range.
         fn partition_route(partition: i64, cluster: &str) -> RouteConfig {
             RouteConfig {
                 match_criteria: RouteConfigMatch {
@@ -366,15 +248,24 @@ mod tests {
             }
         }
 
-        // Config carries filter_metadata that the interceptor is expected to see.
+        // Config carries both untyped and typed metadata the interceptor sees.
         let mut filter_metadata = std::collections::HashMap::new();
         filter_metadata.insert("partitioning".to_string(), Struct::default());
+        let mut typed_filter_metadata = std::collections::HashMap::new();
+        typed_filter_metadata.insert(
+            "partitioning-typed".to_string(),
+            Any {
+                type_url: "type.example/Partitioning".to_string(),
+                value: vec![1, 2, 3],
+            },
+        );
         let metadata = RouteConfigMetadata::from_proto(Metadata {
             filter_metadata,
-            ..Default::default()
+            typed_filter_metadata,
         });
 
-        let rc = Arc::new(RouteConfigResource {
+        let cache = XdsCache::new();
+        cache.update_route_config(Arc::new(RouteConfigResource {
             name: "rc".into(),
             virtual_hosts: vec![VirtualHostConfig {
                 name: "vh".into(),
@@ -385,21 +276,24 @@ mod tests {
                 ],
             }],
             metadata,
-        });
-
-        let cache = XdsCache::new();
-        cache.update_route_config(rc);
+        }));
+        let router: Arc<dyn Router> = Arc::new(XdsRouter::new(&cache));
         tokio::task::yield_now().await;
 
-        /// Reads the `hint` header, verifies metadata is delivered, and injects
-        /// the partition header the router selects on.
+        /// Reads the `hint` header, verifies metadata delivery, and injects the
+        /// partition header the router selects on.
         struct PartitionInterceptor;
         impl PreRouteInterceptor for PartitionInterceptor {
             fn on_request(&self, headers: &mut http::HeaderMap, metadata: &RouteConfigMetadata) {
                 assert!(
                     metadata.filter_metadata("partitioning").is_some(),
-                    "interceptor must see the RouteConfiguration metadata",
+                    "interceptor must see the untyped metadata",
                 );
+                let typed = metadata
+                    .typed_filter_metadata("partitioning-typed")
+                    .expect("interceptor must see the typed metadata");
+                assert_eq!(typed.type_url, "type.example/Partitioning");
+                assert_eq!(typed.value.as_ref(), [1, 2, 3]);
                 let partition = match headers.get("hint").and_then(|v| v.to_str().ok()) {
                     Some("a") => "1",
                     _ => "2",
@@ -424,13 +318,8 @@ mod tests {
             })
         };
 
-        let watcher = Arc::new(RouteConfigWatcher::new(&cache));
-        let router: Arc<dyn Router> = Arc::new(XdsRouter);
         let interceptor: Arc<dyn PreRouteInterceptor> = Arc::new(PartitionInterceptor);
-        let svc = RouteConfigSelectorLayer::new(watcher).layer(
-            PreRouteLayer::new(interceptor)
-                .layer(XdsRoutingLayer::new(router, Arc::from("svc")).layer(terminal)),
-        );
+        let svc = XdsRoutingLayer::new(router, Some(interceptor), Arc::from("svc")).layer(terminal);
 
         // hint "a" -> partition 1 -> cluster-p1
         let req = Request::builder().header("hint", "a").body(()).unwrap();

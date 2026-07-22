@@ -149,7 +149,7 @@ pub use client::channel::{
 };
 pub use client::route::PreRouteInterceptor;
 pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
-pub use xds::resource::route_config::RouteConfigMetadata;
+pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
 

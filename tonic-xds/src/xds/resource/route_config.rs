@@ -14,13 +14,23 @@ use xds_client::{Error, Resource};
 
 use super::string_matcher::StringMatcher;
 
-/// Read-only view over an xDS resource's `metadata.filter_metadata`
-/// (see [`envoy.config.core.v3.Metadata`]).
+/// A `typed_filter_metadata` entry — a `google.protobuf.Any` (a type URL plus an
+/// encoded message value).
+#[derive(Debug, Clone)]
+pub struct TypedMetadata {
+    /// Type URL identifying the message encoded in `value`.
+    pub type_url: String,
+    /// The encoded message; decode it according to `type_url`.
+    pub value: Bytes,
+}
+
+/// Read-only view over an xDS resource's `metadata` (see
+/// [`envoy.config.core.v3.Metadata`]).
 ///
-/// Each `filter_metadata` namespace carries a `google.protobuf.Struct`; this
-/// exposes it as the **encoded protobuf bytes** (keyed by namespace) so
-/// consumers can decode it with their own prost message — for example a
-/// `Struct`, or a typed config proto that shares its wire format.
+/// Exposes both metadata maps — untyped `filter_metadata`
+/// (`google.protobuf.Struct`) and typed `typed_filter_metadata`
+/// (`google.protobuf.Any`) — as encoded bytes, so consumers can decode them with
+/// their own prost messages.
 ///
 /// This is the spec-native carrier for extensions that ride on standard xDS
 /// `metadata`, surfaced so that a pre-route interceptor (or other consumer) can
@@ -31,10 +41,12 @@ use super::string_matcher::StringMatcher;
 pub struct RouteConfigMetadata {
     /// Encoded `google.protobuf.Struct` bytes, keyed by `filter_metadata` namespace.
     filter_metadata: HashMap<String, Bytes>,
+    /// Typed `google.protobuf.Any` entries, keyed by `typed_filter_metadata` namespace.
+    typed_filter_metadata: HashMap<String, TypedMetadata>,
 }
 
 impl RouteConfigMetadata {
-    /// Returns the encoded `google.protobuf.Struct` for the `filter_metadata`
+    /// Returns the encoded untyped `filter_metadata` `google.protobuf.Struct` for
     /// `namespace`, if present. Decode it with a prost message (for example a
     /// `Struct`, or a typed config proto sharing its wire format).
     #[must_use]
@@ -42,21 +54,44 @@ impl RouteConfigMetadata {
         self.filter_metadata.get(namespace).cloned()
     }
 
-    /// Returns `true` when no `filter_metadata` namespaces are present.
+    /// Returns the typed `typed_filter_metadata` `google.protobuf.Any` for
+    /// `namespace`, if present.
+    #[must_use]
+    pub fn typed_filter_metadata(&self, namespace: &str) -> Option<TypedMetadata> {
+        self.typed_filter_metadata.get(namespace).cloned()
+    }
+
+    /// Returns `true` when both metadata maps are empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.filter_metadata.is_empty()
+        self.filter_metadata.is_empty() && self.typed_filter_metadata.is_empty()
     }
 
     /// Builds the view from an xDS `Metadata`, pre-encoding each namespace's
-    /// `Struct` to bytes.
+    /// `Struct`/`Any` to bytes.
     pub(crate) fn from_proto(metadata: Metadata) -> Self {
         let filter_metadata = metadata
             .filter_metadata
             .into_iter()
             .map(|(namespace, value)| (namespace, Bytes::from(value.encode_to_vec())))
             .collect();
-        Self { filter_metadata }
+        let typed_filter_metadata = metadata
+            .typed_filter_metadata
+            .into_iter()
+            .map(|(namespace, any)| {
+                (
+                    namespace,
+                    TypedMetadata {
+                        type_url: any.type_url,
+                        value: Bytes::from(any.value),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            filter_metadata,
+            typed_filter_metadata,
+        }
     }
 }
 
