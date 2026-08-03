@@ -170,9 +170,7 @@ impl StringMatcher {
             MatchPatternOneof::SafeRegex(r) => {
                 let pattern = r.regex();
                 let pattern = pattern.to_str().unwrap_or_default();
-                let re = Regex::new(pattern)
-                    .map_err(|e| Error::Validation(format!("invalid regex '{pattern}': {e}")))?;
-                Ok(Self::SafeRegex(re))
+                Ok(Self::SafeRegex(compile_regex(pattern, "string matcher")?))
             }
             MatchPatternOneof::not_set(_) => Err(Error::Validation(
                 "StringMatcher has no match_pattern set".into(),
@@ -191,6 +189,17 @@ fn non_empty_match_value(value: &str, kind: &str) -> xds_client::Result<String> 
         )));
     }
     Ok(value.to_string())
+}
+
+/// Compiles a `RegexMatcher` pattern, rejecting the empty pattern.
+fn compile_regex(pattern: &str, kind: &str) -> xds_client::Result<Regex> {
+    if pattern.is_empty() {
+        return Err(Error::Validation(format!(
+            "empty {kind} regex is not allowed"
+        )));
+    }
+    Regex::new(pattern)
+        .map_err(|e| Error::Validation(format!("invalid {kind} regex '{pattern}': {e}")))
 }
 
 impl Resource for RouteConfigResource {
@@ -300,9 +309,7 @@ fn validate_route_match(rm: RouteMatchView<'_>) -> xds_client::Result<RouteMatch
         PathSpecifierOneof::SafeRegex(r) => {
             let pattern = r.regex();
             let pattern = pattern.to_str().unwrap_or_default();
-            let re = Regex::new(pattern)
-                .map_err(|e| Error::Validation(format!("invalid path regex '{pattern}': {e}")))?;
-            PathSpecifier::SafeRegex(re)
+            PathSpecifier::SafeRegex(compile_regex(pattern, "path")?)
         }
         // Per A28: not having path_specifier will cause a NACK.
         PathSpecifierOneof::not_set(_) => {
@@ -334,19 +341,24 @@ fn validate_route_match(rm: RouteMatchView<'_>) -> xds_client::Result<RouteMatch
 
     // Per A28: use runtime_fraction.default_value, normalize to numerator out
     // of 1,000,000. runtime_key is ignored (gRPC has no runtime config).
-    let match_fraction = rm.runtime_fraction_opt().and_then(|rf| {
-        if !rf.has_default_value() {
-            return None;
+    let match_fraction = match rm.runtime_fraction_opt() {
+        None => None,
+        Some(rf) => {
+            if !rf.has_default_value() {
+                return Err(Error::Validation(
+                    "runtime_fraction is missing its required default_value".into(),
+                ));
+            }
+            let frac = rf.default_value();
+            let scale = match frac.denominator() {
+                DenominatorType::Hundred => 10_000,
+                DenominatorType::TenThousand => 100,
+                DenominatorType::Million => 1,
+                _ => 1,
+            };
+            Some(frac.numerator().saturating_mul(scale).min(1_000_000))
         }
-        let frac = rf.default_value();
-        let scale = match frac.denominator() {
-            DenominatorType::Hundred => 10_000,
-            DenominatorType::TenThousand => 100,
-            DenominatorType::Million => 1,
-            _ => 1,
-        };
-        Some(frac.numerator().saturating_mul(scale).min(1_000_000))
-    });
+    };
 
     Ok(RouteMatch {
         path_specifier,
@@ -358,6 +370,9 @@ fn validate_route_match(rm: RouteMatchView<'_>) -> xds_client::Result<RouteMatch
 
 fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<HeaderMatcher> {
     let name = hm.name().to_str().unwrap_or_default().to_string();
+    if name.is_empty() {
+        return Err(Error::Validation("header matcher name is empty".into()));
+    }
 
     // Legacy matchers are deprecated in favor of StringMatch but remain
     // widely used and are still required by gRFC A63.
@@ -372,9 +387,9 @@ fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<Head
         HeaderMatchSpecifierOneof::SafeRegexMatch(r) => {
             let pattern = r.regex();
             let pattern = pattern.to_str().unwrap_or_default();
-            let re = Regex::new(pattern)
-                .map_err(|e| Error::Validation(format!("invalid header regex '{pattern}': {e}")))?;
-            HeaderMatchSpecifier::String(StringMatcher::SafeRegex(re))
+            HeaderMatchSpecifier::String(StringMatcher::SafeRegex(compile_regex(
+                pattern, "header",
+            )?))
         }
         HeaderMatchSpecifierOneof::RangeMatch(r) => HeaderMatchSpecifier::Range {
             start: r.start(),
@@ -506,13 +521,16 @@ impl VirtualHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::envoy::config::core::v3::RuntimeFractionalPercent;
     use crate::generated::envoy::config::route::v3::weighted_cluster::ClusterWeight;
     use crate::generated::envoy::config::route::v3::{
         HeaderMatcher as EnvoyHeaderMatcher, QueryParameterMatcher, RedirectAction,
         Route as EnvoyRoute, RouteAction as EnvoyRouteAction, RouteMatch as EnvoyRouteMatch,
         VirtualHost as EnvoyVirtualHost, WeightedCluster as EnvoyWeightedCluster,
     };
+    use crate::generated::envoy::r#type::matcher::v3::RegexMatcher;
     use crate::generated::envoy::r#type::matcher::v3::StringMatcher as EnvoyStringMatcher;
+    use crate::generated::envoy::r#type::v3::FractionalPercent;
     use protobuf::Serialize;
     use protobuf_well_known_types::UInt32Value;
 
@@ -924,5 +942,96 @@ mod tests {
         let bytes = rc.serialize().expect("serialize");
         let deserialized = RouteConfigResource::deserialize(bytes::Bytes::from(bytes)).unwrap();
         assert_eq!(RouteConfigResource::name(&deserialized), "test");
+    }
+
+    fn route_config_with_match(route_match: EnvoyRouteMatch) -> RouteConfiguration {
+        let mut route_action = EnvoyRouteAction::new();
+        route_action.set_cluster("cluster-1");
+
+        let mut route = EnvoyRoute::new();
+        route.set_match(route_match);
+        route.set_route(route_action);
+
+        let mut vh = EnvoyVirtualHost::new();
+        vh.set_name("vh1");
+        vh.domains_mut().push("*");
+        vh.routes_mut().push(route);
+
+        let mut rc = RouteConfiguration::new();
+        rc.set_name("rc-1");
+        rc.virtual_hosts_mut().push(vh);
+        rc
+    }
+
+    #[test]
+    fn validate_rejects_empty_path_regex() {
+        let mut regex = RegexMatcher::new();
+        regex.set_regex("");
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_safe_regex(regex);
+
+        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
+        assert!(err.to_string().contains("empty path regex"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_header_regex() {
+        let mut regex = RegexMatcher::new();
+        regex.set_regex("");
+        let mut header = EnvoyHeaderMatcher::new();
+        header.set_name("x-test");
+        header.set_safe_regex_match(regex);
+
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_prefix("/");
+        route_match.headers_mut().push(header);
+
+        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
+        assert!(err.to_string().contains("empty header regex"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_header_matcher_name() {
+        let mut header = EnvoyHeaderMatcher::new();
+        header.set_present_match(true);
+
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_prefix("/");
+        route_match.headers_mut().push(header);
+
+        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
+        assert!(err.to_string().contains("header matcher name is empty"));
+    }
+
+    #[test]
+    fn validate_runtime_fraction_normalizes_denominator() {
+        let mut frac = FractionalPercent::new();
+        frac.set_numerator(25);
+        frac.set_denominator(DenominatorType::Hundred);
+        let mut rf = RuntimeFractionalPercent::new();
+        rf.set_default_value(frac);
+
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_prefix("/");
+        route_match.set_runtime_fraction(rf);
+
+        let validated =
+            RouteConfigResource::validate(route_config_with_match(route_match)).unwrap();
+        assert_eq!(
+            validated.virtual_hosts[0].routes[0]
+                .route_match
+                .match_fraction,
+            Some(250_000)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_runtime_fraction_without_default_value() {
+        let mut route_match = EnvoyRouteMatch::new();
+        route_match.set_prefix("/");
+        route_match.set_runtime_fraction(RuntimeFractionalPercent::new());
+
+        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
+        assert!(err.to_string().contains("default_value"));
     }
 }

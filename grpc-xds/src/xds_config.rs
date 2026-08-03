@@ -68,8 +68,9 @@ pub(crate) struct XdsConfig {
 impl XdsConfig {
     /// Constructs a snapshot for a selected virtual host.
     ///
-    /// Returns `None` if `virtual_host_index` is invalid or an inline route
-    /// configuration is not the same allocation held by the listener.
+    /// Returns `None` if `virtual_host_index` is invalid, or if `route_config`
+    /// is not the route configuration the listener actually points at: the
+    /// same allocation for an inline config, or the same name for RDS.
     pub(crate) fn try_new(
         listener: Arc<ListenerResource>,
         route_config: Arc<RouteConfigResource>,
@@ -77,10 +78,10 @@ impl XdsConfig {
         clusters: HashMap<String, ClusterResult>,
     ) -> Option<Self> {
         route_config.virtual_hosts.get(virtual_host_index)?;
-        if let RouteSource::Inline(inline) = &listener.route_source
-            && !Arc::ptr_eq(inline, &route_config)
-        {
-            return None;
+        match &listener.route_source {
+            RouteSource::Inline(inline) if !Arc::ptr_eq(inline, &route_config) => return None,
+            RouteSource::Rds(name) if *name != route_config.name => return None,
+            _ => {}
         }
         Some(Self {
             listener,
@@ -246,5 +247,25 @@ mod tests {
         let snapshot_route_config = route_config();
         let listener = inline_listener(listener_route_config);
         assert!(XdsConfig::try_new(listener, snapshot_route_config, 0, HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn selected_virtual_host_accepts_matching_rds_name() {
+        let route_config = route_config();
+        let listener = Arc::new(ListenerResource {
+            name: "listener".into(),
+            route_source: RouteSource::Rds("routes".into()),
+        });
+        assert!(XdsConfig::try_new(listener, route_config, 0, HashMap::new()).is_some());
+    }
+
+    #[test]
+    fn selected_virtual_host_rejects_mismatched_rds_name() {
+        let route_config = route_config();
+        let listener = Arc::new(ListenerResource {
+            name: "listener".into(),
+            route_source: RouteSource::Rds("other-routes".into()),
+        });
+        assert!(XdsConfig::try_new(listener, route_config, 0, HashMap::new()).is_none());
     }
 }

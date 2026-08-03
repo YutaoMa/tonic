@@ -32,6 +32,11 @@ use crate::generated::envoy::config::cluster::v3::cluster::DiscoveryType;
 use crate::generated::envoy::config::cluster::v3::{Cluster, cluster::ClusterDiscoveryTypeOneof};
 use crate::generated::envoy::extensions::clusters::aggregate::v3::ClusterConfig as AggregateClusterConfig;
 
+/// Extension name and `typed_config` type for gRFC A37 aggregate clusters.
+const AGGREGATE_CLUSTER_NAME: &str = "envoy.clusters.aggregate";
+const AGGREGATE_CLUSTER_CONFIG_TYPE_URL: &str =
+    "type.googleapis.com/envoy.extensions.clusters.aggregate.v3.ClusterConfig";
+
 // TODO: model `transport_socket` (security) and load-balancing-policy
 // config once the dependency manager and LB policies exist to consume them.
 /// Validated Cluster resource.
@@ -92,7 +97,7 @@ impl Resource for ClusterResource {
                 validate_logical_dns_discovery(&message)?
             }
             ClusterDiscoveryTypeOneof::ClusterType(custom)
-                if custom.name().to_str().unwrap_or_default() == "envoy.clusters.aggregate" =>
+                if custom.name().to_str().unwrap_or_default() == AGGREGATE_CLUSTER_NAME =>
             {
                 validate_aggregate_discovery(custom)?
             }
@@ -230,6 +235,12 @@ fn validate_aggregate_discovery(
         ));
     }
     let any = custom.typed_config();
+    let type_url = any.type_url().to_str().unwrap_or_default();
+    if type_url != AGGREGATE_CLUSTER_CONFIG_TYPE_URL {
+        return Err(Error::Validation(format!(
+            "unexpected aggregate cluster typed_config type_url: '{type_url}'"
+        )));
+    }
     let cluster_config = AggregateClusterConfig::parse(any.value()).map_err(|e| {
         Error::Validation(format!("failed to unmarshal aggregate cluster config: {e}"))
     })?;
@@ -423,6 +434,27 @@ mod tests {
             }
             other => panic!("expected Aggregate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn validate_aggregate_rejects_unexpected_typed_config_type_url() {
+        let mut inner = AggregateClusterConfig::new();
+        inner.clusters_mut().push("child-a");
+
+        let mut any = Any::new();
+        any.set_type_url("type.googleapis.com/envoy.config.cluster.v3.Cluster");
+        any.set_value(inner.serialize().expect("serialize"));
+
+        let mut custom = CustomClusterType::new();
+        custom.set_name("envoy.clusters.aggregate");
+        custom.set_typed_config(any);
+
+        let mut cluster = Cluster::new();
+        cluster.set_name("aggregate-cluster");
+        cluster.set_cluster_type(custom);
+
+        let err = ClusterResource::validate(cluster).unwrap_err();
+        assert!(err.to_string().contains("type_url"));
     }
 
     #[test]

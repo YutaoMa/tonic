@@ -86,18 +86,28 @@ pub(crate) enum HealthStatus {
     Healthy,
     Unhealthy,
     Draining,
+    Degraded,
+    /// A status this build does not recognize, carrying the raw wire value.
+    ///
+    /// Treated as unusable, like every status other than `Unknown` and
+    /// `Healthy`.
+    Other(i32),
 }
 
 impl From<EnvoyHealthStatus> for HealthStatus {
     fn from(value: EnvoyHealthStatus) -> Self {
         match value {
+            EnvoyHealthStatus::Unknown => Self::Unknown,
             EnvoyHealthStatus::Healthy => Self::Healthy,
             // Envoy's TIMEOUT is documented as "interpreted by Envoy as
-            // UNHEALTHY". Per gRFC A27, only HEALTHY and UNKNOWN are usable;
-            // DEGRADED and anything unrecognized fall back to Unknown below.
+            // UNHEALTHY".
             EnvoyHealthStatus::Unhealthy | EnvoyHealthStatus::Timeout => Self::Unhealthy,
             EnvoyHealthStatus::Draining => Self::Draining,
-            _ => Self::Unknown,
+            EnvoyHealthStatus::Degraded => Self::Degraded,
+            // `HealthStatus` is an open enum, so a newer control plane can send
+            // a status this build does not know. Per gRFC A27 only HEALTHY and
+            // UNKNOWN are usable, so an unrecognized status fails closed.
+            other => Self::Other(i32::from(other)),
         }
     }
 }
@@ -401,6 +411,79 @@ mod tests {
         let validated = EndpointsResource::validate(cla).unwrap();
         // Healthy + Unknown = 2 (Unhealthy excluded).
         assert_eq!(validated.healthy_endpoints().count(), 2);
+    }
+
+    #[test]
+    fn healthy_endpoints_excludes_degraded_and_unrecognized() {
+        let mut locality_lb_endpoints = make_locality_endpoints("us-east-1", 0);
+        locality_lb_endpoints
+            .lb_endpoints_mut()
+            .push(make_lb_endpoint(
+                "10.0.0.1",
+                8080,
+                EnvoyHealthStatus::Degraded,
+            ));
+        locality_lb_endpoints
+            .lb_endpoints_mut()
+            .push(make_lb_endpoint(
+                "10.0.0.2",
+                8080,
+                EnvoyHealthStatus::from(99),
+            ));
+
+        let mut cla = ClusterLoadAssignment::new();
+        cla.set_cluster_name("my-cluster");
+        cla.endpoints_mut().push(locality_lb_endpoints);
+
+        let validated = EndpointsResource::validate(cla).unwrap();
+        assert_eq!(validated.localities[0].endpoints.len(), 2);
+        assert_eq!(validated.healthy_endpoints().count(), 0);
+        assert_eq!(
+            validated.localities[0].endpoints[0].health_status,
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn unrecognized_health_status_survives_the_wire_and_is_not_usable() {
+        let mut locality_lb_endpoints = make_locality_endpoints("us-east-1", 0);
+        locality_lb_endpoints
+            .lb_endpoints_mut()
+            .push(make_lb_endpoint(
+                "10.0.0.1",
+                8080,
+                EnvoyHealthStatus::from(99),
+            ));
+
+        let mut cla = ClusterLoadAssignment::new();
+        cla.set_cluster_name("my-cluster");
+        cla.endpoints_mut().push(locality_lb_endpoints);
+
+        let bytes = cla.serialize().expect("serialize");
+        let decoded =
+            EndpointsResource::deserialize(bytes::Bytes::from(bytes)).expect("deserialize");
+        assert_eq!(
+            i32::from(
+                decoded
+                    .endpoints()
+                    .get(0)
+                    .expect("locality")
+                    .lb_endpoints()
+                    .get(0)
+                    .expect("endpoint")
+                    .health_status()
+            ),
+            99,
+            "protobuf runtime must preserve unrecognized enum values"
+        );
+
+        let validated = EndpointsResource::validate(decoded).unwrap();
+        assert_eq!(
+            validated.localities[0].endpoints[0].health_status,
+            HealthStatus::Other(99),
+            "an unrecognized status must keep its raw value for debugging"
+        );
+        assert_eq!(validated.healthy_endpoints().count(), 0);
     }
 
     #[test]

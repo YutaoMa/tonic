@@ -37,6 +37,9 @@ use crate::generated::envoy::extensions::filters::network::http_connection_manag
     HttpConnectionManager, http_connection_manager::RouteSpecifierOneof,
 };
 
+/// The only `api_listener` extension gRPC supports.
+const HTTP_CONNECTION_MANAGER_TYPE_URL: &str = "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager";
+
 /// How the listener obtains its route configuration.
 #[derive(Debug, Clone)]
 pub(crate) enum RouteSource {
@@ -77,6 +80,9 @@ impl Resource for ListenerResource {
 
     fn validate(message: Self::Message) -> xds_client::Result<Self> {
         let name = message.name().to_str().unwrap_or_default().to_string();
+        if name.is_empty() {
+            return Err(Error::Validation("listener name is empty".into()));
+        }
 
         if !message.has_api_listener() {
             return Err(Error::Validation(
@@ -91,6 +97,13 @@ impl Resource for ListenerResource {
             ));
         }
         let any: Any = api_listener.api_listener().to_owned();
+
+        let type_url = any.type_url().to_str().unwrap_or_default();
+        if type_url != HTTP_CONNECTION_MANAGER_TYPE_URL {
+            return Err(Error::Validation(format!(
+                "unexpected api_listener type_url: '{type_url}'"
+            )));
+        }
 
         let hcm = HttpConnectionManager::parse(any.value()).map_err(|e| {
             Error::Validation(format!("failed to decode HttpConnectionManager: {e}"))
@@ -212,6 +225,26 @@ mod tests {
         listener.set_name("test-listener");
         let err = ListenerResource::validate(listener).unwrap_err();
         assert!(err.to_string().contains("api_listener"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_listener_name() {
+        let listener = make_rds_listener("", "route-config-1");
+        let err = ListenerResource::validate(listener).unwrap_err();
+        assert!(err.to_string().contains("listener name is empty"));
+    }
+
+    #[test]
+    fn validate_rejects_unexpected_api_listener_type_url() {
+        let mut listener = make_rds_listener("test-listener", "route-config-1");
+        let mut any = listener.api_listener().api_listener().to_owned();
+        any.set_type_url("type.googleapis.com/envoy.config.listener.v3.Listener");
+        let mut api_listener = ApiListener::new();
+        api_listener.set_api_listener(any);
+        listener.set_api_listener(api_listener);
+
+        let err = ListenerResource::validate(listener).unwrap_err();
+        assert!(err.to_string().contains("unexpected api_listener type_url"));
     }
 
     #[test]
