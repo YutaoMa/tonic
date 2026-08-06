@@ -72,9 +72,12 @@ use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
+use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
@@ -82,10 +85,7 @@ use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 use crate::credentials::client::ChannelSecurityInfo;
 use crate::private;
 use crate::rt::BoxedTaskHandle;
@@ -393,6 +393,7 @@ impl Transport for TransportBuilder {
         })
         .initial_stream_window_size(opts.init_stream_window_size)
         .initial_connection_window_size(opts.init_connection_window_size)
+        .adaptive_window(opts.http2_adaptive_window)
         .keep_alive_interval(opts.http2_keep_alive_interval)
         .clone();
 
@@ -402,10 +403,6 @@ impl Transport for TransportBuilder {
 
         if let Some(val) = opts.http2_keep_alive_while_idle {
             settings.keep_alive_while_idle(val);
-        }
-
-        if let Some(val) = opts.http2_adaptive_window {
-            settings.adaptive_window(val);
         }
 
         if let Some(val) = opts.http2_max_header_list_size {
