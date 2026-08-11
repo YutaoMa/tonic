@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(decision.cluster, "cluster-b");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn xds_router_returns_not_ready_without_config() {
         let cache = XdsCache::new();
         let router = XdsRouter::new(&cache);
@@ -1130,17 +1130,18 @@ mod tests {
         // blocks and then reports NotReady.
         assert!(router.snapshot().is_none());
         assert!(matches!(router.acquire(), AcquiredConfig::Pending(_)));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            router.acquire().get(),
-        )
-        .await;
-        // Either the inner timeout fires (NotReady) or the outer timeout
-        // fires (config never arrived) — both are correct.
-        match result {
-            Ok(Err(RoutingError::NotReady)) => {}
-            Err(_elapsed) => {}
-            other => panic!("expected NotReady or timeout, got {other:?}"),
-        }
+
+        let start = tokio::time::Instant::now();
+        let result = router.acquire().get().await;
+
+        assert!(
+            matches!(result, Err(RoutingError::NotReady)),
+            "expected NotReady, got {result:?}",
+        );
+        assert!(
+            start.elapsed() >= DEFAULT_READY_TIMEOUT,
+            "expected the wait to span the full ready timeout, took {:?}",
+            start.elapsed(),
+        );
     }
 }
