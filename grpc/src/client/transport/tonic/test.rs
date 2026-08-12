@@ -59,18 +59,19 @@ use crate::client::CallOptions;
 use crate::client::Channel;
 use crate::client::Invoke as _;
 use crate::client::RecvStream as _;
+use crate::client::RequestHeaders;
+use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream as _;
+use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 use crate::credentials::ChannelCredentials;
 use crate::credentials::CompositeChannelCredentials;
 use crate::credentials::LocalChannelCredentials;
@@ -167,9 +168,14 @@ pub(crate) async fn tonic_transport_rpc() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, mut disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -694,9 +700,14 @@ async fn tonic_transport_invalid_base64_headers() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,
@@ -770,9 +781,14 @@ async fn tonic_transport_recv_drop_cancels_send() {
         authority: Authority::new("localhost".to_string(), None),
         handshake_info: ClientHandshakeInfo::default(),
     };
+    let address = Address {
+        network_type: TCP_IP_NETWORK_TYPE,
+        address: addr.to_string().into(),
+        attributes: Attributes::new(),
+    };
     let (conn, _sec_info, _disconnection_listener) = builder
         .dyn_connect(
-            addr.to_string(),
+            &address,
             GrpcRuntime::new(TokioRuntime::default()),
             &securty_opts,
             &config,

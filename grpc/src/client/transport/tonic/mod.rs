@@ -72,20 +72,21 @@ use crate::StatusError;
 use crate::client::CallOptions;
 use crate::client::Invoke;
 use crate::client::RecvStream;
+use crate::client::RequestHeaders;
+use crate::client::ResponseHeaders;
 use crate::client::ResponseStreamItem;
 use crate::client::SendOptions;
 use crate::client::SendStream;
+use crate::client::Trailers;
 use crate::client::name_resolution::TCP_IP_NETWORK_TYPE;
 use crate::client::name_resolution::UNIX_NETWORK_TYPE;
 use crate::client::transport::SecurityOpts;
 use crate::client::transport::Transport;
 use crate::client::transport::TransportOptions;
 use crate::client::transport::registry::GLOBAL_TRANSPORT_REGISTRY;
+use crate::core::Address;
 use crate::core::RecvMessage;
-use crate::core::RequestHeaders;
-use crate::core::ResponseHeaders;
 use crate::core::SendMessage;
-use crate::core::Trailers;
 use crate::credentials::client::ChannelSecurityInfo;
 use crate::private;
 use crate::rt::BoxedTaskHandle;
@@ -372,7 +373,7 @@ impl Transport for TransportBuilder {
 
     async fn connect(
         &self,
-        address: String,
+        address: &Address,
         runtime: GrpcRuntime,
         security_info: &SecurityOpts,
         opts: &TransportOptions,
@@ -412,7 +413,7 @@ impl Transport for TransportBuilder {
         let transport_fut = match self.network_type {
             NetworkType::Tcp => {
                 let addr: SocketAddr =
-                    SocketAddr::from_str(&address).map_err(|err| err.to_string())?;
+                    SocketAddr::from_str(&address.address).map_err(|err| err.to_string())?;
                 runtime.tcp_stream(
                     addr,
                     TcpOptions {
@@ -421,9 +422,10 @@ impl Transport for TransportBuilder {
                     },
                 )
             }
-            NetworkType::Unix => {
-                runtime.unix_stream(PathBuf::from(&address), UnixSocketOptions::default())
-            }
+            NetworkType::Unix => runtime.unix_stream(
+                PathBuf::from(&*address.address),
+                UnixSocketOptions::default(),
+            ),
         };
         let transport = transport_fut.await?;
         let credentials = &security_info.credentials;
@@ -464,7 +466,7 @@ impl Transport for TransportBuilder {
         let (service, worker) = Buffer::pair(service, DEFAULT_BUFFER_SIZE);
         runtime.spawn(Box::pin(worker));
         let authority = &security_info.authority.host_port_string();
-        let uri = Uri::from_maybe_shared(format!("http://{}", &authority))
+        let uri = Uri::from_maybe_shared(format!("http://{}", authority))
             .map_err(|e| format!("failed to create URL with authority {}: {}", authority, e))?;
         let grpc = Grpc::with_origin(TonicService { inner: service }, uri);
 
