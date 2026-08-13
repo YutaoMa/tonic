@@ -400,6 +400,7 @@ mod tests {
     use crate::xds::resource::route_config::{
         RouteConfig, RouteConfigAction, RouteConfigMatch, VirtualHostConfig,
     };
+    use crate::xds::resource::safe_regex::SafeRegex;
     use crate::xds::resource::string_matcher::StringMatcher;
 
     fn simple_route(prefix: &str, cluster: &str) -> RouteConfig {
@@ -661,7 +662,7 @@ mod tests {
             routes: vec![RouteConfig {
                 match_criteria: RouteConfigMatch {
                     path_specifier: PathSpecifierConfig::SafeRegex(
-                        regex::Regex::new("^/svc/.*").unwrap(),
+                        SafeRegex::new("/svc/.*").unwrap(),
                     ),
                     headers: vec![],
                     case_sensitive: true,
@@ -1034,7 +1035,7 @@ mod tests {
                         headers: vec![HeaderMatcherConfig {
                             name: "x-tag".into(),
                             match_specifier: HeaderMatchSpecifierConfig::String(
-                                StringMatcher::SafeRegex(regex::Regex::new("^v[0-9]+$").unwrap()),
+                                StringMatcher::SafeRegex(SafeRegex::new("v[0-9]+").unwrap()),
                             ),
                             invert_match: false,
                         }],

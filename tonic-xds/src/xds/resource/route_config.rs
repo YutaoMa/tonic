@@ -34,12 +34,11 @@ use envoy_types::pb::envoy::config::route::v3::{
     RetryPolicy, RouteConfiguration, RouteMatch, route, route_action, route_match,
 };
 use prost::Message;
-use regex::Regex;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
+use super::safe_regex::SafeRegex;
 use super::string_matcher::StringMatcher;
-
 /// A `typed_filter_metadata` entry — a `google.protobuf.Any` (a type URL plus an
 /// encoded message value).
 #[derive(Debug, Clone)]
@@ -276,7 +275,7 @@ pub(crate) struct RouteConfigMatch {
 pub(crate) enum PathSpecifierConfig {
     Prefix(String),
     Path(String),
-    SafeRegex(Regex),
+    SafeRegex(SafeRegex),
 }
 
 /// Header matching criteria.
@@ -443,13 +442,7 @@ fn validate_route_match(rm: RouteMatch) -> xds_client::Result<RouteConfigMatch> 
         Some(route_match::PathSpecifier::Prefix(p)) => PathSpecifierConfig::Prefix(p),
         Some(route_match::PathSpecifier::Path(p)) => PathSpecifierConfig::Path(p),
         Some(route_match::PathSpecifier::SafeRegex(r)) => {
-            // Envoy's `RouteMatch.safe_regex` requires that "the entire path (without
-            // the query string) must match the regex" and that "the rule will not
-            // match if only a subsequence of the `:path` header matches".
-            // The pattern is wrapped in a non-capturing group
-            // so a top-level alternation cannot escape the anchors, and `\A`/`\z` are used
-            // rather than `^`/`$` so a trailing newline cannot bypass the end anchor.
-            let re = Regex::new(&format!(r"\A(?:{})\z", r.regex))
+            let re = SafeRegex::new(&r.regex)
                 .map_err(|e| Error::Validation(format!("invalid path regex '{}': {e}", r.regex)))?;
             PathSpecifierConfig::SafeRegex(re)
         }
@@ -522,7 +515,7 @@ fn validate_header_matcher(
         // SafeRegexMatch is deprecated in favor of StringMatch, which is handled below.
         #[allow(deprecated)]
         Some(HeaderMatchSpecifier::SafeRegexMatch(r)) => {
-            let re = Regex::new(&r.regex).map_err(|e| {
+            let re = SafeRegex::new(&r.regex).map_err(|e| {
                 Error::Validation(format!("invalid header regex '{}': {e}", r.regex))
             })?;
             HeaderMatchSpecifierConfig::String(StringMatcher::SafeRegex(re))
@@ -843,6 +836,33 @@ mod tests {
         assert!(
             !re.is_match("/aX"),
             "an alternation branch must not match a longer path"
+        );
+    }
+
+    #[test]
+    fn safe_regex_header_matcher_requires_a_full_match() {
+        use envoy_types::pb::envoy::config::route::v3::HeaderMatcher;
+        use envoy_types::pb::envoy::config::route::v3::header_matcher::HeaderMatchSpecifier;
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        #[allow(deprecated)]
+        let hm = HeaderMatcher {
+            name: "x-version".into(),
+            header_match_specifier: Some(HeaderMatchSpecifier::SafeRegexMatch(RegexMatcher {
+                regex: "v[0-9]+".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_header_matcher(hm).expect("valid regex");
+        let HeaderMatchSpecifierConfig::String(m) = matched.match_specifier else {
+            panic!("expected a string matcher");
+        };
+        assert!(m.is_match("v2"));
+        assert!(
+            !m.is_match("v2-beta"),
+            "a longer value sharing the prefix must not match"
         );
     }
 
