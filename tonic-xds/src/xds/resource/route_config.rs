@@ -443,7 +443,13 @@ fn validate_route_match(rm: RouteMatch) -> xds_client::Result<RouteConfigMatch> 
         Some(route_match::PathSpecifier::Prefix(p)) => PathSpecifierConfig::Prefix(p),
         Some(route_match::PathSpecifier::Path(p)) => PathSpecifierConfig::Path(p),
         Some(route_match::PathSpecifier::SafeRegex(r)) => {
-            let re = Regex::new(&r.regex)
+            // Envoy's `RouteMatch.safe_regex` requires that "the entire path (without
+            // the query string) must match the regex" and that "the rule will not
+            // match if only a subsequence of the `:path` header matches".
+            // The pattern is wrapped in a non-capturing group
+            // so a top-level alternation cannot escape the anchors, and `\A`/`\z` are used
+            // rather than `^`/`$` so a trailing newline cannot bypass the end anchor.
+            let re = Regex::new(&format!(r"\A(?:{})\z", r.regex))
                 .map_err(|e| Error::Validation(format!("invalid path regex '{}': {e}", r.regex)))?;
             PathSpecifierConfig::SafeRegex(re)
         }
@@ -782,6 +788,62 @@ mod tests {
                 .path_specifier,
             PathSpecifierConfig::Path(p) if p == "/service/Method"
         ));
+    }
+
+    #[test]
+    fn safe_regex_path_matcher_requires_a_full_match() {
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        let unanchored_rm = RouteMatch {
+            path_specifier: Some(route_match::PathSpecifier::SafeRegex(RegexMatcher {
+                regex: r"/pkg\.Greeter/SayHello".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_route_match(unanchored_rm).expect("valid regex");
+        let PathSpecifierConfig::SafeRegex(re) = matched.path_specifier else {
+            panic!("expected a SafeRegex path specifier");
+        };
+
+        assert!(
+            re.is_match("/pkg.Greeter/SayHello"),
+            "exact path must match"
+        );
+        assert!(
+            !re.is_match("/pkg.Greeter/SayHelloAgain"),
+            "a longer method sharing the prefix must not match"
+        );
+        assert!(
+            !re.is_match("/other.Svc/x/pkg.Greeter/SayHello"),
+            "the pattern must not match as a substring of a longer path"
+        );
+    }
+
+    #[test]
+    fn safe_regex_path_matcher_anchors_each_alternation_branch() {
+        use envoy_types::pb::envoy::r#type::matcher::v3::RegexMatcher;
+
+        let rm = RouteMatch {
+            path_specifier: Some(route_match::PathSpecifier::SafeRegex(RegexMatcher {
+                regex: "/a|/b".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let matched = validate_route_match(rm).expect("valid regex");
+        let PathSpecifierConfig::SafeRegex(re) = matched.path_specifier else {
+            panic!("expected a SafeRegex path specifier");
+        };
+
+        assert!(re.is_match("/a"));
+        assert!(re.is_match("/b"));
+        assert!(
+            !re.is_match("/aX"),
+            "an alternation branch must not match a longer path"
+        );
     }
 
     #[test]

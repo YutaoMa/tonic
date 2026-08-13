@@ -128,20 +128,17 @@ impl Router for XdsRouter {
         input: &RouteInput<'_>,
         config: &RoutingSnapshot,
     ) -> Result<RouteDecision, RoutingError> {
-        resolve_route(config, input.authority, input.headers)
+        resolve_route(config, input.authority, input.path, input.headers)
     }
 }
 
-/// Resolve a route decision from the given config, authority, and headers.
+/// Resolve a route decision from the given config, authority, path, and headers.
 fn resolve_route(
     rc: &RoutingSnapshot,
     authority: &str,
+    path: &str,
     headers: &http::HeaderMap,
 ) -> Result<RouteDecision, RoutingError> {
-    let path = headers
-        .get(":path")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("/");
     let route = rc.matched_route(authority, path, headers)?;
     let cluster = match &route.action {
         RouteConfigAction::Cluster(name) => name.clone(),
@@ -1124,6 +1121,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "my-service",
+            path: "/",
             headers: &headers,
         };
         let config = router.snapshot().expect("config");
@@ -1142,6 +1140,7 @@ mod tests {
         let headers = http::HeaderMap::new();
         let input = RouteInput {
             authority: "svc",
+            path: "/",
             headers: &headers,
         };
 
