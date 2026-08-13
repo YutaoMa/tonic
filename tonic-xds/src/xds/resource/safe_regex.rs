@@ -47,8 +47,9 @@ impl SafeRegex {
     /// Compile `pattern` to match only the entire input.
     ///
     /// The non-capturing group keeps a top-level alternation from escaping the
-    /// anchors; `\A`/`\z` are used rather than `^`/`$` so a trailing newline
-    /// cannot bypass the end anchor.
+    /// anchors and confines any inline flags the pattern sets; `\A`/`\z` hold
+    /// regardless of those flags, whereas `^`/`$` become line anchors under
+    /// `(?m)`.
     pub(crate) fn new(pattern: &str) -> Result<Self, regex::Error> {
         Regex::new(&format!("{ANCHOR_PREFIX}{pattern}{ANCHOR_SUFFIX}")).map(Self)
     }
@@ -104,9 +105,17 @@ mod tests {
     }
 
     #[test]
-    fn a_trailing_newline_does_not_bypass_the_end_anchor() {
+    fn does_not_match_a_trailing_newline() {
         let re = SafeRegex::new("/a").unwrap();
         assert!(!re.is_match("/a\n"));
+    }
+
+    #[test]
+    fn inline_flags_cannot_widen_the_anchors() {
+        // A control plane could set `(?m)`; the anchors must still bind to the
+        // whole haystack rather than to a line within it.
+        let re = SafeRegex::new("(?m)/a").unwrap();
+        assert!(!re.is_match("x\n/a\ny"));
     }
 
     #[test]
