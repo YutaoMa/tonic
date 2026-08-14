@@ -51,6 +51,10 @@ impl SafeRegex {
     /// regardless of those flags, whereas `^`/`$` become line anchors under
     /// `(?m)`.
     pub(crate) fn new(pattern: &str) -> Result<Self, regex::Error> {
+        // Splicing is only sound for a pattern that is valid alone: a free `)`
+        // closes ANCHOR_PREFIX early, leaving `foo)|bar(?:` spliced as the
+        // unanchored `\A(?:foo)|bar(?:)\z`.
+        Regex::new(pattern)?;
         Regex::new(&format!("{ANCHOR_PREFIX}{pattern}{ANCHOR_SUFFIX}")).map(Self)
     }
 
@@ -121,6 +125,49 @@ mod tests {
     #[test]
     fn an_invalid_pattern_is_rejected() {
         assert!(SafeRegex::new("(unclosed").is_err());
+    }
+
+    #[test]
+    fn splicing_into_the_anchors_is_rejected() {
+        for pattern in ["foo)|bar(?:", "foo)(?:bar", ")(?:", "a)(?:b", r")\"] {
+            assert!(
+                SafeRegex::new(pattern).is_err(),
+                "{pattern:?} is not valid alone and must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn commenting_out_the_anchors_is_rejected() {
+        assert!(Regex::new("(?x)#").is_ok(), "valid on its own");
+        assert!(SafeRegex::new("(?x)#").is_err());
+    }
+
+    #[test]
+    fn realistic_patterns_full_match() {
+        for (pattern, matches, rejects) in [
+            (".*", "anything", "a\nb"),
+            ("/a|/b", "/b", "/bX"),
+            ("(?i)/Foo", "/fOO", "/Foo/bar"),
+            ("v[0-9]+", "v12", "v12a"),
+            ("[)]", ")", "))"),
+            (r"\)", ")", "x)"),
+            ("(?:a|b)+", "abab", "abc"),
+            ("/caf€/.*", "/caf€/x", "y/caf€/x"),
+            (
+                r"/pkg\.[A-Za-z]+/.*",
+                "/pkg.Greeter/SayHello",
+                "/pkg.Greeter",
+            ),
+        ] {
+            let re = SafeRegex::new(pattern)
+                .unwrap_or_else(|e| panic!("{pattern:?} should compile: {e}"));
+            assert!(re.is_match(matches), "{pattern:?} should match {matches:?}");
+            assert!(
+                !re.is_match(rejects),
+                "{pattern:?} should not match {rejects:?}"
+            );
+        }
     }
 
     #[test]
