@@ -57,12 +57,53 @@ const ENV_BOOTSTRAP_CONFIG: &str = "GRPC_XDS_BOOTSTRAP_CONFIG";
 /// let config = BootstrapConfig::from_json(json).unwrap();
 /// ```
 ///
+/// # Inspecting
+///
+/// The fields are private so new bootstrap keys can be added without breaking
+/// changes. The accessors below report what a loaded config will act on.
+///
+/// ```rust
+/// use tonic_xds::BootstrapConfig;
+///
+/// let json = r#"{
+///   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+///   "node": {"id": "node-1"}
+/// }"#;
+/// let config = BootstrapConfig::from_json(json).unwrap();
+/// assert_eq!(config.server_uri(), "xds.example.com:443");
+/// assert_eq!(config.node_id(), "node-1");
+/// ```
+///
+/// # Testing
+///
+/// [`BootstrapConfig`] is [`PartialEq`], so a caller that derives bootstrap
+/// JSON from its own configuration can assert the whole result against a
+/// golden config. Keys the schema does not define are ignored during parsing,
+/// so this also catches a misplaced key that would otherwise be silently dropped.
+///
+/// ```rust
+/// use tonic_xds::BootstrapConfig;
+///
+/// let expected = BootstrapConfig::from_json(
+///     r#"{"xds_servers":[{"server_uri":"xds:443"}],"node":{"id":"n1"}}"#,
+/// )
+/// .unwrap();
+///
+/// // `node_id` belongs under `node`; at the top level it is not part of the
+/// // schema and is dropped.
+/// let actual = BootstrapConfig::from_json(
+///     r#"{"xds_servers":[{"server_uri":"xds:443"}],"node_id":"n1"}"#,
+/// )
+/// .unwrap();
+///
+/// assert_ne!(expected, actual);
+/// ```
+///
+/// [`from_env`]: BootstrapConfig::from_env
 /// [gRFC A27]: https://github.com/grpc/proposal/blob/master/A27-xds-global-load-balancing.md
-// TODO: Design a public builder API for constructing BootstrapConfig
-// programmatically (not just from JSON). The current `new()` is pub(crate);
-// a public API should use the builder pattern to accommodate future fields
-// without breaking changes.
-#[derive(Debug, Clone, Deserialize)]
+// Construction is JSON-only: gRFC A27 is the interop contract, and a second
+// programmatic surface would be a parallel schema to keep in sync.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[non_exhaustive]
 pub struct BootstrapConfig {
     /// xDS management servers to connect to.
@@ -85,7 +126,7 @@ pub struct BootstrapConfig {
 }
 
 /// Configuration for a single xDS management server.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct XdsServerConfig {
     /// URI of the xDS server (e.g., `"xds.example.com:443"`).
     pub server_uri: String,
@@ -100,7 +141,7 @@ pub(crate) struct XdsServerConfig {
 }
 
 /// A channel credential entry from the bootstrap config.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct ChannelCredentialConfig {
     /// Credential type (e.g., `"insecure"`, `"tls"`, `"google_default"`).
     #[serde(rename = "type")]
@@ -131,7 +172,7 @@ pub(crate) enum ChannelCredentialType {
 /// fields. See [gRFC A29].
 ///
 /// [gRFC A29]: https://github.com/grpc/proposal/blob/master/A29-xds-tls-security.md
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 // In non-TLS builds `cert_provider` is gated out, so nothing reads these
 // fields after serde populates them.
 #[cfg_attr(not(feature = "_tls-any"), allow(dead_code))]
@@ -142,7 +183,7 @@ pub(crate) struct CertProviderPluginConfig {
 }
 
 /// Node identity configuration from bootstrap JSON.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub(crate) struct NodeConfig {
     /// Opaque node identifier.
     #[serde(default)]
@@ -184,7 +225,7 @@ fn json_to_metadata(value: serde_json::Value) -> Result<MetadataValue, Bootstrap
 }
 
 /// Locality configuration from bootstrap JSON.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct LocalityConfig {
     #[serde(default)]
     pub region: String,
@@ -273,12 +314,22 @@ impl BootstrapConfig {
         Ok(())
     }
 
-    /// Returns the URI of the first xDS server.
-    pub(crate) fn server_uri(&self) -> &str {
+    /// Returns the URI of the xDS server this config connects to.
+    ///
+    /// Only the first entry is used; further `xds_servers` are parsed but not
+    /// yet connected to.
+    pub fn server_uri(&self) -> &str {
         self.xds_servers
             .first()
             .map(|s| s.server_uri.as_str())
             .expect("xds_servers validated non-empty")
+    }
+
+    /// Returns the node identifier presented to the xDS server.
+    ///
+    /// Empty when the bootstrap omits `node.id`.
+    pub fn node_id(&self) -> &str {
+        &self.node.id
     }
 
     /// Select the first supported channel credential type from the first server's config.
@@ -301,8 +352,8 @@ impl BootstrapConfig {
             })
     }
 
-    /// Returns `true` if the first server's selected credential is TLS.
-    pub(crate) fn use_tls(&self) -> bool {
+    /// Returns `true` if the connection to the xDS server uses TLS.
+    pub fn use_tls(&self) -> bool {
         matches!(
             self.selected_credential(),
             Some(ChannelCredentialType::Tls | ChannelCredentialType::GoogleDefault)
@@ -511,6 +562,55 @@ mod tests {
         let config = BootstrapConfig::from_json(json).unwrap();
         let node = Node::try_from(config.node).unwrap();
         assert!(node.id.is_none());
+    }
+
+    #[test]
+    fn public_accessors_report_what_the_client_will_use() {
+        let json = r#"{
+            "xds_servers": [
+                {"server_uri": "primary:443", "channel_creds": [{"type": "tls"}]},
+                {"server_uri": "fallback:443"}
+            ],
+            "node": {"id": "node-1"}
+        }"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+
+        assert_eq!(config.server_uri(), "primary:443");
+        assert_eq!(config.node_id(), "node-1");
+        assert!(config.use_tls());
+    }
+
+    #[test]
+    fn public_accessors_report_absent_optional_fields() {
+        let json = r#"{"xds_servers": [{"server_uri": "localhost:5000"}]}"#;
+        let config = BootstrapConfig::from_json(json).unwrap();
+
+        assert_eq!(config.node_id(), "");
+        assert!(!config.use_tls());
+    }
+
+    #[test]
+    fn equal_configs_compare_equal_regardless_of_json_formatting() {
+        let compact = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node":{"id":"n1"}}"#;
+        let spaced = r#"{
+            "node": {"id": "n1"},
+            "xds_servers": [{"server_uri": "xds:443"}]
+        }"#;
+
+        assert_eq!(
+            BootstrapConfig::from_json(compact).unwrap(),
+            BootstrapConfig::from_json(spaced).unwrap(),
+        );
+    }
+
+    #[test]
+    fn misplaced_keys_are_dropped_and_compare_unequal() {
+        let intended = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node":{"id":"n1"}}"#;
+        let misplaced = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node_id":"n1"}"#;
+
+        let misparsed = BootstrapConfig::from_json(misplaced).unwrap();
+        assert_eq!(misparsed.node_id(), "");
+        assert_ne!(BootstrapConfig::from_json(intended).unwrap(), misparsed);
     }
 
     #[test]
