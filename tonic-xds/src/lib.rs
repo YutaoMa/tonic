@@ -54,7 +54,8 @@
 //!
 //! | Method | How |
 //! |--------|-----|
-//! | Programmatic | [`BootstrapConfig::from_json`] then [`XdsChannelConfig::with_bootstrap`] |
+//! | Programmatic (builder) | [`BootstrapConfig::builder`] then [`XdsChannelConfig::with_bootstrap`] |
+//! | Programmatic (JSON) | [`BootstrapConfig::from_json`] then [`XdsChannelConfig::with_bootstrap`] |
 //! | Environment (explicit) | [`XdsChannelConfig::with_bootstrap_from_env`] |
 //! | Environment (implicit) | Omit bootstrap; the builder loads from env vars automatically |
 //!
@@ -96,6 +97,26 @@
 //!     "xds_servers": [{"server_uri": "xds.example.com:443"}],
 //!     "node": {"id": "my-node", "cluster": "my-cluster"}
 //! }"#).unwrap();
+//!
+//! let target = XdsUri::parse("xds:///myservice:50051").unwrap();
+//! let channel = XdsChannelBuilder::new(
+//!     XdsChannelConfig::new(target).with_bootstrap(bootstrap),
+//! ).build_grpc_channel().unwrap();
+//!
+//! // let client = MyServiceClient::new(channel);
+//! ```
+//!
+//! ### Using the builder
+//!
+//! ```rust,no_run
+//! use tonic_xds::{BootstrapConfig, ChannelCredentialType, XdsChannelBuilder, XdsChannelConfig, XdsUri};
+//!
+//! let bootstrap = BootstrapConfig::builder("xds.example.com:443")
+//!     .channel_creds([ChannelCredentialType::Tls])
+//!     .node_id("my-node")
+//!     .node_cluster("my-cluster")
+//!     .build()
+//!     .unwrap();
 //!
 //! let target = XdsUri::parse("xds:///myservice:50051").unwrap();
 //! let channel = XdsChannelBuilder::new(
@@ -182,7 +203,9 @@ pub use client::retry::{
 pub use client::route::PreRouteInterceptor;
 pub use common::async_util::BoxFuture;
 pub use shared_http_body::SharedBody;
-pub use xds::bootstrap::{BootstrapConfig, BootstrapError};
+pub use xds::bootstrap::{
+    BootstrapConfig, BootstrapConfigBuilder, BootstrapError, ChannelCredentialType,
+};
 pub use xds::resource::route_config::{RouteConfigMetadata, TypedMetadata};
 pub use xds::uri::{XdsUri, XdsUriError};
 pub use xds_client::TonicCallCredentials;
