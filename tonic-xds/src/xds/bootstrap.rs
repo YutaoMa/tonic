@@ -495,17 +495,17 @@ impl BootstrapConfig {
 
     /// Select the first supported channel credential type from the first server's config.
     ///
-    /// [`validate`](Self::validate) guarantees one exists, so a validated
-    /// config always returns `Some`.
+    /// Validation guarantees one exists, so a validated config always returns
+    /// `Some`.
     pub(crate) fn selected_credential(&self) -> Option<&ChannelCredentialType> {
         self.xds_servers.first()?.selected_credential()
     }
 
     /// Returns `true` if the connection to the xDS server uses TLS.
     ///
-    /// [`validate`](Self::validate) requires the `server_uri` scheme to agree
-    /// with the selected credential, so a `true` here means the transport
-    /// really does handshake.
+    /// Every constructor requires the `server_uri` scheme to agree with the
+    /// selected credential, so a `true` here means the transport really does
+    /// handshake.
     pub fn use_tls(&self) -> bool {
         self.selected_credential()
             .is_some_and(ChannelCredentialType::is_tls)
