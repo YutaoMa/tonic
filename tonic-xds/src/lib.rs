@@ -38,8 +38,9 @@
 //!
 //! 1. **Provide a bootstrap configuration** that tells the client where
 //!    the xDS management server lives and what node identity to present.
-//!    The format matches [gRFC A27] — a JSON object with `xds_servers`
-//!    and an optional `node`.
+//!    The format matches [gRFC A27] — a JSON object with `xds_servers`,
+//!    each entry carrying a `server_uri` and the `channel_creds` types the
+//!    client may offer, plus an optional `node`.
 //!
 //! 2. **Build the channel** with [`XdsChannelBuilder`], pointing it at
 //!    an `xds:///` target URI.
@@ -67,7 +68,10 @@
 //!
 //! ```json
 //! {
-//!   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!   "xds_servers": [{
+//!     "server_uri": "xds.example.com:443",
+//!     "channel_creds": [{"type": "tls"}]
+//!   }],
 //!   "node": {"id": "my-node"}
 //! }
 //! ```
@@ -94,7 +98,10 @@
 //! use tonic_xds::{BootstrapConfig, XdsChannelBuilder, XdsChannelConfig, XdsUri};
 //!
 //! let bootstrap = BootstrapConfig::from_json(r#"{
-//!     "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!     "xds_servers": [{
+//!         "server_uri": "xds.example.com:443",
+//!         "channel_creds": [{"type": "tls"}]
+//!     }],
 //!     "node": {"id": "my-node", "cluster": "my-cluster"}
 //! }"#).unwrap();
 //!
@@ -142,7 +149,10 @@
 //!
 //! ```json
 //! {
-//!   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+//!   "xds_servers": [{
+//!     "server_uri": "xds.example.com:443",
+//!     "channel_creds": [{"type": "tls"}]
+//!   }],
 //!   "certificate_providers": {
 //!     "root_ca":  { "plugin_name": "file_watcher", "config": {
 //!       "ca_certificate_file": "/etc/certs/ca.pem"

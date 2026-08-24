@@ -53,7 +53,12 @@ const ENV_BOOTSTRAP_CONFIG: &str = "GRPC_XDS_BOOTSTRAP_CONFIG";
 /// let config = BootstrapConfig::from_env().unwrap();
 ///
 /// // From a JSON string:
-/// let json = r#"{"xds_servers":[{"server_uri":"xds.example.com:443"}]}"#;
+/// let json = r#"{
+///   "xds_servers": [{
+///     "server_uri": "xds.example.com:443",
+///     "channel_creds": [{"type": "tls"}]
+///   }]
+/// }"#;
 /// let config = BootstrapConfig::from_json(json).unwrap();
 /// ```
 ///
@@ -66,12 +71,16 @@ const ENV_BOOTSTRAP_CONFIG: &str = "GRPC_XDS_BOOTSTRAP_CONFIG";
 /// use tonic_xds::BootstrapConfig;
 ///
 /// let json = r#"{
-///   "xds_servers": [{"server_uri": "xds.example.com:443"}],
+///   "xds_servers": [{
+///     "server_uri": "xds.example.com:443",
+///     "channel_creds": [{"type": "tls"}]
+///   }],
 ///   "node": {"id": "node-1"}
 /// }"#;
 /// let config = BootstrapConfig::from_json(json).unwrap();
 /// assert_eq!(config.server_uri(), "xds.example.com:443");
 /// assert_eq!(config.node_id(), "node-1");
+/// assert!(config.use_tls());
 /// ```
 ///
 /// # Building programmatically
@@ -151,6 +160,10 @@ pub(crate) struct XdsServerConfig {
     /// URI of the xDS server (e.g., `"xds.example.com:443"`).
     pub server_uri: String,
     /// Ordered list of channel credentials. The client uses the first supported type.
+    ///
+    /// gRFC A27 requires the key. `#[serde(default)]` routes a missing list to
+    /// [`BootstrapConfig::validate`], which reports it with the same message it
+    /// gives an empty or unknown-only one.
     #[serde(default)]
     pub channel_creds: Vec<ChannelCredentialConfig>,
     /// Server features (e.g., `["xds_v3"]`).
@@ -158,6 +171,24 @@ pub(crate) struct XdsServerConfig {
     #[allow(dead_code)]
     // Parsed for completeness; used when server feature negotiation is added.
     pub server_features: Vec<String>,
+}
+
+impl XdsServerConfig {
+    /// First credential type this client supports, per gRFC A27.
+    ///
+    /// Skips unknown types so a bootstrap written for a newer client still
+    /// resolves. Returns `None` for a config still awaiting
+    /// [`BootstrapConfig::validate`], which requires a match.
+    fn selected_credential(&self) -> Option<&ChannelCredentialType> {
+        self.channel_creds.iter().map(|c| &c.cred_type).find(|t| {
+            matches!(
+                t,
+                ChannelCredentialType::Insecure
+                    | ChannelCredentialType::Tls
+                    | ChannelCredentialType::GoogleDefault
+            )
+        })
+    }
 }
 
 /// A channel credential entry from the bootstrap config.
@@ -198,6 +229,24 @@ pub enum ChannelCredentialType {
     #[serde(untagged)]
     #[non_exhaustive]
     Unsupported(String),
+}
+
+impl ChannelCredentialType {
+    /// The bootstrap JSON spelling, so errors name what the caller wrote.
+    fn as_json_name(&self) -> &str {
+        match self {
+            Self::Insecure => "insecure",
+            Self::Tls => "tls",
+            Self::GoogleDefault => "google_default",
+            Self::Unsupported(name) => name,
+        }
+    }
+
+    /// Whether this type expects a TLS handshake. `google_default` counts:
+    /// it negotiates TLS outside its ALTS environments.
+    fn is_tls(&self) -> bool {
+        matches!(self, Self::Tls | Self::GoogleDefault)
+    }
 }
 
 /// A certificate provider plugin entry from the bootstrap config.
@@ -341,11 +390,13 @@ impl BootstrapConfig {
     /// Runs on both construction paths — `TryFrom<BootstrapConfigDe>`, which
     /// covers [`from_json`], [`from_env`] and `Deserialize`, and
     /// [`BootstrapConfigBuilder::build`] — so [`server_uri`] can index
-    /// `xds_servers` directly.
+    /// `xds_servers` directly and [`use_tls`] reports a credential the client
+    /// actually selected.
     ///
     /// [`from_json`]: BootstrapConfig::from_json
     /// [`from_env`]: BootstrapConfig::from_env
     /// [`server_uri`]: BootstrapConfig::server_uri
+    /// [`use_tls`]: BootstrapConfig::use_tls
     fn validate(&self) -> Result<(), BootstrapError> {
         if self.xds_servers.is_empty() {
             return Err(BootstrapError::Validation(
@@ -358,6 +409,68 @@ impl BootstrapConfig {
                     "xds_servers[{i}].server_uri must not be empty"
                 )));
             }
+            // gRFC A27 requires `channel_creds` to name at least one type the
+            // client supports. Enforcing it makes the control plane's security
+            // level an explicit choice, so a missing, empty or unknown-only
+            // list fails here.
+            let Some(selected) = server.selected_credential() else {
+                let listed = server
+                    .channel_creds
+                    .iter()
+                    .map(|c| c.cred_type.as_json_name())
+                    .collect::<Vec<_>>();
+                let found = if listed.is_empty() {
+                    "it is missing or empty".to_string()
+                } else {
+                    format!("found only [{}]", listed.join(", "))
+                };
+                return Err(BootstrapError::Validation(format!(
+                    "xds_servers[{i}].channel_creds must list at least one credential type this \
+                     client supports (insecure, tls, google_default); {found}"
+                )));
+            };
+            Self::validate_uri_scheme(i, &server.server_uri, selected)?;
+        }
+        Ok(())
+    }
+
+    /// Requires the `server_uri` and the selected credential to agree on TLS.
+    ///
+    /// The scheme drives the handshake: the transport upgrades a scheme-less
+    /// URI to `https` when the bootstrap selects TLS, keeps any explicit scheme
+    /// as written, and handshakes for `https` alone. TLS therefore holds on
+    /// exactly those two forms. Any other scheme — `http://`, `unix://`,
+    /// anything unrecognised — connects in the clear while the client reports a
+    /// secure channel and attaches call credentials to it.
+    ///
+    /// `https://` with `insecure` states the same conflict from the other side
+    /// and fails at connect time, so this catches it up front.
+    fn validate_uri_scheme(
+        index: usize,
+        server_uri: &str,
+        credential: &ChannelCredentialType,
+    ) -> Result<(), BootstrapError> {
+        // Mirrors the transport, which parses with `http::Uri` as well: it
+        // reports no scheme for the bare authority form (`xds.example.com:443`)
+        // it upgrades, and errors on the forms it hands to its own connectors
+        // (`unix://...`). A parse error therefore counts as plaintext.
+        let parsed = server_uri.parse::<http::Uri>();
+        let upgraded_to_tls = matches!(&parsed, Ok(uri) if uri.scheme_str().is_none());
+        let is_https = matches!(&parsed, Ok(uri) if uri.scheme_str() == Some("https"));
+        let cred = credential.as_json_name();
+
+        if credential.is_tls() && !(upgraded_to_tls || is_https) {
+            return Err(BootstrapError::Validation(format!(
+                "xds_servers[{index}].server_uri '{server_uri}' connects in plaintext but \
+                 channel_creds selects '{cred}'; use an 'https://' or scheme-less URI, or \
+                 select 'insecure'"
+            )));
+        }
+        if !credential.is_tls() && is_https {
+            return Err(BootstrapError::Validation(format!(
+                "xds_servers[{index}].server_uri '{server_uri}' requires TLS but channel_creds \
+                 selects '{cred}'; list 'tls' or 'google_default', or drop the 'https://' scheme"
+            )));
         }
         Ok(())
     }
@@ -382,30 +495,20 @@ impl BootstrapConfig {
 
     /// Select the first supported channel credential type from the first server's config.
     ///
-    /// Per gRFC A27, the client stops at the first credential type it supports.
-    /// Returns `None` if no supported credential type is found.
+    /// [`validate`](Self::validate) guarantees one exists, so a validated
+    /// config always returns `Some`.
     pub(crate) fn selected_credential(&self) -> Option<&ChannelCredentialType> {
-        self.xds_servers
-            .first()?
-            .channel_creds
-            .iter()
-            .map(|c| &c.cred_type)
-            .find(|t| {
-                matches!(
-                    t,
-                    ChannelCredentialType::Insecure
-                        | ChannelCredentialType::Tls
-                        | ChannelCredentialType::GoogleDefault
-                )
-            })
+        self.xds_servers.first()?.selected_credential()
     }
 
     /// Returns `true` if the connection to the xDS server uses TLS.
+    ///
+    /// [`validate`](Self::validate) requires the `server_uri` scheme to agree
+    /// with the selected credential, so a `true` here means the transport
+    /// really does handshake.
     pub fn use_tls(&self) -> bool {
-        matches!(
-            self.selected_credential(),
-            Some(ChannelCredentialType::Tls | ChannelCredentialType::GoogleDefault)
-        )
+        self.selected_credential()
+            .is_some_and(ChannelCredentialType::is_tls)
     }
 
     /// Starts building a bootstrap config for the given xDS server URI.
@@ -436,9 +539,9 @@ impl BootstrapConfig {
 
 /// Builds a [`BootstrapConfig`] without going through JSON.
 ///
-/// Created by [`BootstrapConfig::builder`]. Every setter is optional except
-/// the server URI, which [`BootstrapConfig::builder`] takes up front because
-/// the config is invalid without it.
+/// Created by [`BootstrapConfig::builder`], which takes the required server URI
+/// up front. gRFC A27 also requires [`channel_creds`], which [`build`] checks.
+/// Every other setter is optional.
 ///
 /// The builder covers the bootstrap keys the client acts on. A bootstrap that
 /// needs keys outside that set — additional `xds_servers` entries, which are
@@ -459,6 +562,8 @@ impl BootstrapConfig {
 /// assert!(config.use_tls());
 /// ```
 ///
+/// [`channel_creds`]: BootstrapConfigBuilder::channel_creds
+/// [`build`]: BootstrapConfigBuilder::build
 /// [`from_json`]: BootstrapConfig::from_json
 #[derive(Debug)]
 pub struct BootstrapConfigBuilder {
@@ -488,10 +593,12 @@ impl BootstrapConfigBuilder {
 
     /// Sets the credentials offered to the xDS server, in preference order.
     ///
-    /// Replaces any previously set credentials. Unset, the client connects to
-    /// the management server in plaintext, matching a bootstrap with no
-    /// `channel_creds`; pass [`ChannelCredentialType::Tls`] for a secured
-    /// server.
+    /// Replaces any previously set credentials. Calling this is required: gRFC
+    /// A27 asks for at least one type the client supports, and [`build`]
+    /// enforces it. Pass [`ChannelCredentialType::Tls`] for a secured server,
+    /// or [`ChannelCredentialType::Insecure`] to state plaintext explicitly.
+    ///
+    /// [`build`]: BootstrapConfigBuilder::build
     #[must_use]
     pub fn channel_creds(mut self, creds: impl IntoIterator<Item = ChannelCredentialType>) -> Self {
         self.channel_creds = creds
@@ -604,11 +711,15 @@ impl BootstrapConfigBuilder {
     /// # Errors
     ///
     /// - [`BootstrapError::Serialization`] if a metadata or certificate
-    ///   provider value could not be serialized to JSON; the first failing
-    ///   setter wins.
-    /// - [`BootstrapError::Validation`] if the server URI is empty — the same
-    ///   validation configs parsed from JSON go through — or if the
-    ///   credentials include [`ChannelCredentialType::Unsupported`].
+    ///   provider value failed to serialize to JSON; the first failing setter
+    ///   wins.
+    /// - [`BootstrapError::Validation`] if the credentials include
+    ///   [`ChannelCredentialType::Unsupported`], or if the config fails the
+    ///   same validation JSON-parsed configs go through: an empty server URI,
+    ///   no supported [`channel_creds`], or a URI scheme that disagrees with
+    ///   the selected credential.
+    ///
+    /// [`channel_creds`]: BootstrapConfigBuilder::channel_creds
     pub fn build(self) -> Result<BootstrapConfig, BootstrapError> {
         if let Some(error) = self.error {
             return Err(error);
@@ -630,7 +741,7 @@ impl BootstrapConfigBuilder {
             xds_servers: vec![XdsServerConfig {
                 server_uri: self.server_uri,
                 channel_creds: self.channel_creds,
-                // The client acts on no server feature yet, so the builder
+                // Server feature negotiation is still to come, so the builder
                 // omits a setter.
                 server_features: Vec::new(),
             }],
@@ -685,7 +796,10 @@ mod tests {
 
     fn minimal_json() -> &'static str {
         r#"{
-            "xds_servers": [{"server_uri": "xds.example.com:443"}],
+            "xds_servers": [{
+                "server_uri": "xds.example.com:443",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "node": {"id": "test-node"}
         }"#
     }
@@ -791,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_credential_none_supported() {
+    fn unknown_only_channel_creds_fail() {
         let json = r#"{
             "xds_servers": [{
                 "server_uri": "localhost:5000",
@@ -799,18 +913,129 @@ mod tests {
             }],
             "node": {"id": "n1"}
         }"#;
-        let config = BootstrapConfig::from_json(json).unwrap();
-        assert!(matches!(
-            config.xds_servers[0].channel_creds[0].cred_type,
-            ChannelCredentialType::Unsupported(_)
-        ));
-        assert_eq!(config.selected_credential(), None);
+        // gRFC A27 requires a type the client supports; an unknown-only list
+        // otherwise falls through to a plaintext control-plane connection.
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(matches!(err, BootstrapError::Validation(_)));
+        assert!(
+            err.to_string()
+                .contains("channel_creds must list at least one")
+        );
+        assert!(err.to_string().contains("some_future_type"));
     }
 
     #[test]
-    fn selected_credential_empty_creds() {
-        let config = BootstrapConfig::from_json(minimal_json()).unwrap();
-        assert_eq!(config.selected_credential(), None);
+    fn missing_channel_creds_fail() {
+        let json = r#"{
+            "xds_servers": [{"server_uri": "xds.example.com:443"}],
+            "node": {"id": "n1"}
+        }"#;
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("is missing or empty"));
+    }
+
+    #[test]
+    fn empty_channel_creds_fail() {
+        let json = r#"{
+            "xds_servers": [{"server_uri": "localhost:5000", "channel_creds": []}],
+            "node": {"id": "n1"}
+        }"#;
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("is missing or empty"));
+    }
+
+    #[test]
+    fn a_uri_that_cannot_carry_tls_with_tls_creds_fails() {
+        // The transport upgrades the scheme-less form alone and handshakes for
+        // `https` alone, so each of these connects in the clear while `use_tls`
+        // reports a secure channel.
+        for uri in [
+            "http://xds.example.com:443",
+            // Parses, and tonic treats an unrecognised scheme as plaintext.
+            "foo://xds.example.com:443",
+            "dns://xds.example.com:443",
+            // Fails `http::Uri`; the transport routes it to a plaintext connector.
+            "unix:///etc/istio/proxy/XDS",
+            "unix:/etc/istio/proxy/XDS",
+        ] {
+            for cred in ["tls", "google_default"] {
+                let json = format!(
+                    r#"{{
+                        "xds_servers": [{{
+                            "server_uri": "{uri}",
+                            "channel_creds": [{{"type": "{cred}"}}]
+                        }}]
+                    }}"#
+                );
+                let err = BootstrapConfig::from_json(&json)
+                    .expect_err(&format!("{uri} with {cred} should be rejected"));
+                assert!(err.to_string().contains("connects in plaintext"), "{uri}");
+                assert!(err.to_string().contains(cred), "{uri}");
+            }
+        }
+    }
+
+    #[test]
+    fn tls_uri_with_insecure_creds_fails() {
+        let json = r#"{
+            "xds_servers": [{
+                "server_uri": "https://xds.example.com:443",
+                "channel_creds": [{"type": "insecure"}]
+            }]
+        }"#;
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("requires TLS but channel_creds"));
+    }
+
+    #[test]
+    fn explicit_schemes_matching_their_creds_are_accepted() {
+        for (uri, cred, tls) in [
+            ("https://xds.example.com:443", "tls", true),
+            ("http://localhost:18000", "insecure", false),
+            // No scheme: the transport picks one from the credential.
+            ("xds.example.com:443", "google_default", true),
+            // Fails `http::Uri`; the transport routes it to its UDS connector.
+            ("unix:///etc/istio/proxy/XDS", "insecure", false),
+            // An unrecognised scheme stays plaintext, which `insecure` agrees with.
+            ("dns://xds.example.com:443", "insecure", false),
+        ] {
+            let json = format!(
+                r#"{{"xds_servers": [{{"server_uri": "{uri}", "channel_creds": [{{"type": "{cred}"}}]}}]}}"#
+            );
+            let config = BootstrapConfig::from_json(&json)
+                .unwrap_or_else(|e| panic!("{uri} with {cred} should parse: {e}"));
+            assert_eq!(config.use_tls(), tls, "{uri} with {cred}");
+        }
+    }
+
+    #[test]
+    fn a_later_server_is_validated_too() {
+        let json = r#"{
+            "xds_servers": [
+                {"server_uri": "primary:443", "channel_creds": [{"type": "tls"}]},
+                {"server_uri": "fallback:443"}
+            ]
+        }"#;
+        let err = BootstrapConfig::from_json(json).unwrap_err();
+        assert!(err.to_string().contains("xds_servers[1].channel_creds"));
+    }
+
+    #[test]
+    fn builder_rejects_a_plaintext_uri_with_tls_creds() {
+        let err = BootstrapConfig::builder("http://xds.example.com:443")
+            .channel_creds([ChannelCredentialType::Tls])
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("connects in plaintext"));
+    }
+
+    #[test]
+    fn builder_requires_channel_creds() {
+        let err = BootstrapConfig::builder("xds.example.com:443")
+            .node_id("n1")
+            .build()
+            .unwrap_err();
+        assert!(err.to_string().contains("is missing or empty"));
     }
 
     #[test]
@@ -843,7 +1068,10 @@ mod tests {
     #[test]
     fn node_without_id() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}]
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }]
         }"#;
         let config = BootstrapConfig::from_json(json).unwrap();
         let node = Node::try_from(config.node).unwrap();
@@ -855,7 +1083,7 @@ mod tests {
         let json = r#"{
             "xds_servers": [
                 {"server_uri": "primary:443", "channel_creds": [{"type": "tls"}]},
-                {"server_uri": "fallback:443"}
+                {"server_uri": "fallback:443", "channel_creds": [{"type": "tls"}]}
             ],
             "node": {"id": "node-1"}
         }"#;
@@ -868,7 +1096,7 @@ mod tests {
 
     #[test]
     fn public_accessors_report_absent_optional_fields() {
-        let json = r#"{"xds_servers": [{"server_uri": "localhost:5000"}]}"#;
+        let json = r#"{"xds_servers": [{"server_uri": "localhost:5000", "channel_creds": [{"type": "insecure"}]}]}"#;
         let config = BootstrapConfig::from_json(json).unwrap();
 
         assert_eq!(config.node_id(), "");
@@ -877,10 +1105,13 @@ mod tests {
 
     #[test]
     fn equal_configs_compare_equal_regardless_of_json_formatting() {
-        let compact = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node":{"id":"n1"}}"#;
+        let compact = r#"{"xds_servers":[{"server_uri":"xds:443","channel_creds":[{"type":"insecure"}]}],"node":{"id":"n1"}}"#;
         let spaced = r#"{
             "node": {"id": "n1"},
-            "xds_servers": [{"server_uri": "xds:443"}]
+            "xds_servers": [{
+                "server_uri": "xds:443",
+                "channel_creds": [{"type": "insecure"}]
+            }]
         }"#;
 
         assert_eq!(
@@ -891,12 +1122,16 @@ mod tests {
 
     #[test]
     fn misplaced_keys_are_dropped_and_compare_unequal() {
-        let intended = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node":{"id":"n1"}}"#;
-        let misplaced = r#"{"xds_servers":[{"server_uri":"xds:443"}],"node_id":"n1"}"#;
+        let creds = r#""channel_creds":[{"type":"insecure"}]"#;
+        let intended = format!(
+            r#"{{"xds_servers":[{{"server_uri":"xds:443",{creds}}}],"node":{{"id":"n1"}}}}"#
+        );
+        let misplaced =
+            format!(r#"{{"xds_servers":[{{"server_uri":"xds:443",{creds}}}],"node_id":"n1"}}"#);
 
-        let misparsed = BootstrapConfig::from_json(misplaced).unwrap();
+        let misparsed = BootstrapConfig::from_json(&misplaced).unwrap();
         assert_eq!(misparsed.node_id(), "");
-        assert_ne!(BootstrapConfig::from_json(intended).unwrap(), misparsed);
+        assert_ne!(BootstrapConfig::from_json(&intended).unwrap(), misparsed);
     }
 
     #[test]
@@ -929,6 +1164,7 @@ mod tests {
     #[test]
     fn builder_defaults_omit_optional_fields() {
         let built = BootstrapConfig::builder("xds.example.com:443")
+            .channel_creds([ChannelCredentialType::Insecure])
             .node_id("test-node")
             .build()
             .unwrap();
@@ -940,6 +1176,7 @@ mod tests {
     #[test]
     fn builder_carries_metadata_and_cert_providers() {
         let built = BootstrapConfig::builder("localhost:5000")
+            .channel_creds([ChannelCredentialType::Insecure])
             .node_metadata("GENERATOR", "grpc")
             .certificate_provider(
                 "google_cloud_private_spiffe",
@@ -951,7 +1188,10 @@ mod tests {
 
         let equivalent = BootstrapConfig::from_json(
             r#"{
-                "xds_servers": [{"server_uri": "localhost:5000"}],
+                "xds_servers": [{
+                    "server_uri": "localhost:5000",
+                    "channel_creds": [{"type": "insecure"}]
+                }],
                 "node": {"metadata": {"GENERATOR": "grpc"}},
                 "certificate_providers": {
                     "google_cloud_private_spiffe": {
@@ -1051,7 +1291,7 @@ mod tests {
         assert!(err.to_string().contains("xds_servers must not be empty"));
 
         let ok = serde_json::from_str::<BootstrapConfig>(
-            r#"{"xds_servers": [{"server_uri": "xds:443"}]}"#,
+            r#"{"xds_servers": [{"server_uri": "xds:443", "channel_creds": [{"type": "tls"}]}]}"#,
         )
         .unwrap();
         assert_eq!(ok.server_uri(), "xds:443");
@@ -1074,7 +1314,10 @@ mod tests {
     #[test]
     fn parse_node_metadata() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "node": {
                 "id": "n1",
                 "metadata": {
@@ -1097,7 +1340,10 @@ mod tests {
     #[test]
     fn node_from_config_propagates_metadata() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "node": {
                 "id": "n1",
                 "metadata": {"GENERATOR": "grpc"}
@@ -1115,7 +1361,10 @@ mod tests {
     fn parse_istio_style_metadata() {
         // Real-world Istio bootstrap shape: nested objects, numbers, arrays.
         let json = r#"{
-            "xds_servers": [{"server_uri": "unix:///etc/istio/proxy/XDS"}],
+            "xds_servers": [{
+                "server_uri": "unix:///etc/istio/proxy/XDS",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "node": {
                 "id": "sidecar~10.0.0.1~pod.ns~ns.svc.cluster.local",
                 "metadata": {
@@ -1175,7 +1424,10 @@ mod tests {
     #[test]
     fn parse_certificate_providers() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "certificate_providers": {
                 "google_cloud_private_spiffe": {
                     "plugin_name": "file_watcher",
@@ -1234,7 +1486,10 @@ mod tests {
     #[test]
     fn multiple_certificate_provider_instances() {
         let json = r#"{
-            "xds_servers": [{"server_uri": "localhost:5000"}],
+            "xds_servers": [{
+                "server_uri": "localhost:5000",
+                "channel_creds": [{"type": "insecure"}]
+            }],
             "certificate_providers": {
                 "identity": {
                     "plugin_name": "file_watcher",
