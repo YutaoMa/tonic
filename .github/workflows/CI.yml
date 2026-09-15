@@ -126,7 +126,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         cache-targets: "false"
-    - run: cargo hack udeps --workspace --exclude-features=_tls-any,tls,tls-aws-lc,tls-ring,tls-connect-info --each-feature
+    - run: cargo hack udeps --workspace --exclude-features=_tls-any,_tonic-tls-any,tls,tls-aws-lc,tls-ring,tls-connect-info --each-feature
     - run: cargo udeps --package tonic --features tls-ring,transport
     - run: cargo udeps --package tonic --features tls-ring,server
     - run: cargo udeps --package tonic --features tls-ring,channel
