@@ -36,8 +36,6 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::Subchannel;
-use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::WorkScheduler;
 use crate::client::name_resolution::ResolverUpdate;
@@ -54,6 +52,7 @@ pub struct Lazy<T: LbPolicyBuilder> {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Inner<T: LbPolicyBuilder> {
     Void,
     Pending(Pending<T>),
@@ -64,7 +63,7 @@ enum Inner<T: LbPolicyBuilder> {
 struct Pending<T: LbPolicyBuilder> {
     delegate_builder: T,
     options: LbPolicyOptions,
-    latest_state: Option<(ResolverUpdate, Option<<T::LbPolicy as LbPolicy>::LbConfig>)>,
+    latest_state: Option<(ResolverUpdate, <T::LbPolicy as LbPolicy>::LbConfig)>,
 }
 
 impl<T: LbPolicyBuilder> Lazy<T> {
@@ -98,27 +97,16 @@ where
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         match &mut self.inner {
             Inner::Void => unreachable!(),
             Inner::Pending(pending) => {
-                pending.latest_state = Some((update, config.cloned()));
+                pending.latest_state = Some((update, config.clone()));
                 Ok(())
             }
             Inner::Built(delegate) => delegate.resolver_update(update, config, channel_controller),
-        }
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        if let Inner::Built(delegate) = &mut self.inner {
-            delegate.subchannel_update(subchannel, state, channel_controller);
         }
     }
 
@@ -151,7 +139,7 @@ where
         // If there is a pending update, send it now.  Otherwise just exit_idle.
         if let Some((update, config)) = latest_state {
             if delegate
-                .resolver_update(update, config.as_ref(), channel_controller)
+                .resolver_update(update, &config, channel_controller)
                 .is_err()
             {
                 // Notify the channel that it should try to retrieve a new update.
@@ -205,7 +193,6 @@ mod tests {
     enum MockEvent {
         Build,
         ResolverUpdate,
-        SubchannelUpdate,
         Work,
         ExitIdle,
     }
@@ -235,7 +222,7 @@ mod tests {
         assert_eq!(lb_state.connectivity_state, ConnectivityState::Idle);
 
         // Give lazy an update.
-        lazy.resolver_update(ResolverUpdate::default(), None, &mut cc)
+        lazy.resolver_update(ResolverUpdate::default(), &Arc::new(()), &mut cc)
             .unwrap();
 
         // Ensure delegate is not built yet.
@@ -276,7 +263,7 @@ mod tests {
         };
 
         // Give lazy an update.
-        lazy.resolver_update(ResolverUpdate::default(), None, &mut cc)
+        lazy.resolver_update(ResolverUpdate::default(), &Arc::new(()), &mut cc)
             .unwrap();
 
         // Call pick on the picker.
@@ -436,6 +423,12 @@ mod tests {
         fn name(&self) -> &'static str {
             "mock"
         }
+        fn parse_config(
+            &self,
+            _config: &crate::client::load_balancing::ParsedJsonLbConfig,
+        ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
+            Ok(())
+        }
     }
 
     impl LbPolicy for MockPolicy {
@@ -444,19 +437,11 @@ mod tests {
         fn resolver_update(
             &mut self,
             _update: ResolverUpdate,
-            _config: Option<&()>,
+            _config: &(),
             _channel_controller: &mut dyn ChannelController,
         ) -> Result<(), String> {
             self.tx.send(MockEvent::ResolverUpdate).unwrap();
             Ok(())
-        }
-        fn subchannel_update(
-            &mut self,
-            _subchannel: Arc<dyn Subchannel>,
-            _state: &SubchannelState,
-            _channel_controller: &mut dyn ChannelController,
-        ) {
-            self.tx.send(MockEvent::SubchannelUpdate).unwrap();
         }
         fn work(
             &mut self,

@@ -39,20 +39,22 @@ use crate::client::load_balancing::LbPolicyOptions;
 use crate::client::load_balancing::LbState;
 use crate::client::load_balancing::PickResult;
 use crate::client::load_balancing::Picker;
-use crate::client::load_balancing::Subchannel;
-use crate::client::load_balancing::SubchannelState;
 use crate::client::load_balancing::WorkData;
 use crate::client::load_balancing::child_manager::ChildManager;
 use crate::client::load_balancing::child_manager::ChildUpdate;
 use crate::client::load_balancing::pick_first::PickFirstBuilder;
+use crate::client::load_balancing::pick_first::PickFirstConfig;
 use crate::client::name_resolution::Endpoint;
 use crate::client::name_resolution::ResolverUpdate;
 
 pub static POLICY_NAME: &str = "round_robin";
 static START: Once = Once::new();
 
+#[derive(Debug, Default)]
+pub(crate) struct RoundRobinConfig(PickFirstConfig);
+
 #[derive(Debug)]
-pub struct RoundRobinBuilder {}
+pub(crate) struct RoundRobinBuilder {}
 
 impl LbPolicyBuilder for RoundRobinBuilder {
     type LbPolicy = RoundRobinPolicy;
@@ -65,10 +67,17 @@ impl LbPolicyBuilder for RoundRobinBuilder {
     fn name(&self) -> &'static str {
         POLICY_NAME
     }
+
+    fn parse_config(
+        &self,
+        _config: &super::ParsedJsonLbConfig,
+    ) -> Result<<Self::LbPolicy as LbPolicy>::LbConfig, String> {
+        Ok(RoundRobinConfig::default())
+    }
 }
 
 #[derive(Debug)]
-pub struct RoundRobinPolicy {
+pub(crate) struct RoundRobinPolicy {
     child_manager: ChildManager<Endpoint, PickFirstBuilder>,
 }
 
@@ -119,6 +128,7 @@ impl RoundRobinPolicy {
     fn handle_resolver_error(
         &mut self,
         resolver_update: ResolverUpdate,
+        config: &RoundRobinConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         let err = format!(
@@ -133,22 +143,22 @@ impl RoundRobinPolicy {
         // Forward the error to each child, ignoring their responses.
         let _ = self
             .child_manager
-            .resolver_update(resolver_update, None, channel_controller);
+            .resolver_update(resolver_update, &config.0, channel_controller);
         self.update_picker(channel_controller);
         Err(err)
     }
 }
 
 impl LbPolicy for RoundRobinPolicy {
-    type LbConfig = ();
+    type LbConfig = RoundRobinConfig;
     fn resolver_update(
         &mut self,
         update: ResolverUpdate,
-        config: Option<&Self::LbConfig>,
+        config: &Self::LbConfig,
         channel_controller: &mut dyn ChannelController,
     ) -> Result<(), String> {
         if update.endpoints.is_err() {
-            return self.handle_resolver_error(update, channel_controller);
+            return self.handle_resolver_error(update, config, channel_controller);
         }
 
         // Shard the update by endpoint.
@@ -162,7 +172,7 @@ impl LbPolicy for RoundRobinPolicy {
             ChildUpdate {
                 child_identifier: e.clone(),
                 child_policy_builder: PickFirstBuilder {},
-                child_update: Some((update, None)),
+                child_update: Some((update, &config.0)),
             }
         });
         self.child_manager
@@ -179,17 +189,6 @@ impl LbPolicy for RoundRobinPolicy {
 
         self.update_picker(channel_controller);
         Ok(())
-    }
-
-    fn subchannel_update(
-        &mut self,
-        subchannel: Arc<dyn Subchannel>,
-        state: &SubchannelState,
-        channel_controller: &mut dyn ChannelController,
-    ) {
-        self.child_manager
-            .subchannel_update(subchannel, state, channel_controller);
-        self.update_picker(channel_controller);
     }
 
     fn work(&mut self, data: Option<WorkData>, channel_controller: &mut dyn ChannelController) {
@@ -241,6 +240,8 @@ mod test {
 
     use super::*;
     use crate::StatusCodeError;
+    use crate::client::load_balancing::subchannel::Subchannel;
+    use crate::client::load_balancing::subchannel::SubchannelState;
     use crate::client::load_balancing::test_utils;
     use crate::client::load_balancing::test_utils::TestChannelController;
     use crate::client::load_balancing::test_utils::TestEvent;
@@ -296,7 +297,7 @@ mod test {
 
     // Sends a resolver update to the LB policy with the specified endpoint.
     fn send_resolver_update_to_policy(
-        lb_policy: &mut impl LbPolicy,
+        lb_policy: &mut RoundRobinPolicy,
         endpoints: Vec<Endpoint>,
         tcc: &mut dyn ChannelController,
     ) {
@@ -304,7 +305,7 @@ mod test {
             endpoints: Ok(endpoints),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
     }
 
     fn send_resolver_error_to_policy(
@@ -316,25 +317,35 @@ mod test {
             endpoints: Err(err),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
     }
 
+    // Simulates a state change of `subchannel` and delivers the resulting work
+    // to the policy, which routes it to the child that created it.
     fn move_subchannel_to_state(
         lb_policy: &mut impl LbPolicy,
+        rx_events: &mpsc::Receiver<TestEvent>,
         subchannel: Arc<dyn Subchannel>,
         state: &SubchannelState,
         tcc: &mut dyn ChannelController,
     ) {
-        lb_policy.subchannel_update(subchannel, state, tcc);
+        test_utils::schedule_subchannel_update(&subchannel, state.clone());
+        let TestEvent::ScheduleWork(data) = rx_events.recv().unwrap() else {
+            panic!("expected ScheduleWork event");
+        };
+        lb_policy.work(data, tcc);
     }
 
     fn move_subchannel_to_transient_failure(
         lb_policy: &mut impl LbPolicy,
+        rx_events: &mpsc::Receiver<TestEvent>,
         subchannel: Arc<dyn Subchannel>,
         err: &str,
         tcc: &mut dyn ChannelController,
     ) {
-        lb_policy.subchannel_update(
+        move_subchannel_to_state(
+            lb_policy,
+            rx_events,
             subchannel,
             &SubchannelState {
                 connectivity_state: ConnectivityState::TransientFailure,
@@ -550,6 +561,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -609,6 +621,7 @@ mod test {
         let connection_error = String::from("test connection error");
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &connection_error,
             tcc,
@@ -632,6 +645,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -639,6 +653,7 @@ mod test {
         verify_ready_picker(&mut rx_events, subchannels[0].clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -681,7 +696,7 @@ mod test {
             endpoints: Ok(vec![]),
             ..Default::default()
         };
-        let _ = lb_policy.resolver_update(update, None, tcc);
+        let _ = lb_policy.resolver_update(update, &RoundRobinConfig::default(), tcc);
         let want_error = "Received empty address list from the name resolver";
         verify_transient_failure_picker(&mut rx_events, want_error.to_string());
         verify_resolution_request(&mut rx_events);
@@ -700,6 +715,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -707,6 +723,7 @@ mod test {
         let _picker = verify_ready_picker(&mut rx_events, subchannels[0].clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -734,7 +751,13 @@ mod test {
         assert!(picked.contains(&subchannels[1]));
         let subchannel_being_removed = subchannels[1].clone();
         let error = "endpoint down";
-        move_subchannel_to_transient_failure(&mut lb_policy, subchannels[1].clone(), error, tcc);
+        move_subchannel_to_transient_failure(
+            &mut lb_policy,
+            &rx_events,
+            subchannels[1].clone(),
+            error,
+            tcc,
+        );
 
         let new_picker = verify_roundrobin_ready_picker(&mut rx_events);
 
@@ -803,6 +826,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannel_one.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -810,6 +834,7 @@ mod test {
         verify_ready_picker(&mut rx_events, subchannel_one.clone());
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannel_two.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -851,6 +876,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             new_sc.clone(),
             &SubchannelState::ready(),
             tcc,
@@ -883,6 +909,7 @@ mod test {
         let first_error = String::from("test connection error 1");
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &first_error,
             tcc,
@@ -891,6 +918,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_transient_failure(
             &mut lb_policy,
+            &rx_events,
             subchannels[1].clone(),
             &first_error,
             tcc,
@@ -899,6 +927,7 @@ mod test {
         verify_transient_failure_picker(&mut rx_events, first_error);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -934,6 +963,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -943,7 +973,11 @@ mod test {
             endpoints: Ok(vec![]),
             ..Default::default()
         };
-        assert!(lb_policy.resolver_update(update, None, tcc).is_err());
+        assert!(
+            lb_policy
+                .resolver_update(update, &RoundRobinConfig::default(), tcc)
+                .is_err()
+        );
         verify_transient_failure_picker(
             &mut rx_events,
             "Received empty address list from the name resolver".to_string(),
@@ -967,6 +1001,7 @@ mod test {
 
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,
@@ -1012,6 +1047,7 @@ mod test {
         verify_connecting_picker(&mut rx_events);
         move_subchannel_to_state(
             &mut lb_policy,
+            &rx_events,
             subchannels[0].clone(),
             &SubchannelState::ready(),
             tcc,

@@ -31,7 +31,7 @@
 //! - ACK/NACK protocol
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -577,9 +577,8 @@ pub(crate) struct AdsWorker<TB, C, R> {
 }
 
 /// A watcher notification staged during response handling: the channel to
-/// deliver on and the event, carrying its `ProcessingDone` token. Events
-/// that participate in ADS flow control share the response's single
-/// `ProcessingDone` signal; the others carry a detached token.
+/// deliver on and the event, carrying a share of the response's
+/// `ProcessingDone` token.
 type Delivery = (
     mpsc::Sender<ResourceEvent<DecodedResource>>,
     ResourceEvent<DecodedResource>,
@@ -911,6 +910,50 @@ where
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
+        // Wildcard subscriptions can receive an unbounded number of resources
+        // in a single SotW response. Spawn a task that drains the worker's
+        // bounded channel into an unbounded queue and forwards events to the
+        // watcher's bounded channel, so the worker never blocks waiting for the
+        // watcher to drain.
+        let event_tx = if watcher_subscription.is_wildcard() {
+            // Channel has arbitrary size
+            let (worker_tx, mut worker_rx) = mpsc::channel(128);
+            self.runtime.spawn(async move {
+                let mut queue = VecDeque::new();
+                loop {
+                    tokio::select! {
+                        event = worker_rx.recv() => {
+                            match event {
+                                Some(event) => queue.push_back(event),
+                                None => {
+                                    while let Some(event) = queue.pop_front() {
+                                        if event_tx.send(event).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        res = event_tx.reserve(), if !queue.is_empty() => {
+                            match res {
+                                Ok(permit) => {
+                                    if let Some(event) = queue.pop_front() {
+                                        permit.send(event);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        _ = event_tx.closed(), if queue.is_empty() => break,
+                    }
+                }
+            });
+            worker_tx
+        } else {
+            event_tx
+        };
+
         // Track if we need to start a timer (resource in Requested state)
         let mut start_timer_for: Option<String> = None;
         // Track newly-inserted cache entry for the resources gauge (None -> Requested).
@@ -1104,7 +1147,7 @@ where
         // Only notify watchers for per-resource errors (where we know the name).
         // Top-level errors have no associated name, so no watcher to notify.
         for (resource_name, error) in &per_resource_errors {
-            self.notify_resource_error(&mut deliveries, &type_url, resource_name, error);
+            self.notify_resource_error(&mut deliveries, &type_url, resource_name, error, &done);
         }
 
         // Detect deleted resources (per A53):
@@ -1201,14 +1244,14 @@ where
     /// Stage validation-error notifications for a specific resource.
     ///
     /// Per gRFC A46/A88, errors are routed only to watchers interested in
-    /// that specific resource (plus wildcard watchers). Error events do not
-    /// gate flow control (they carry a detached `ProcessingDone` token).
+    /// that specific resource (plus wildcard watchers).
     fn notify_resource_error(
         &mut self,
         deliveries: &mut Vec<Delivery>,
         type_url: &str,
         resource_name: &str,
         error: &str,
+        done: &ProcessingDone,
     ) {
         let type_state = match self.type_states.get_mut(type_url) {
             Some(s) => s,
@@ -1230,7 +1273,7 @@ where
         for event_tx in type_state.matching_watchers(resource_name) {
             let event = ResourceEvent::ResourceChanged {
                 result: Err(Error::Validation(error.to_string())),
-                done: ProcessingDone::detached(),
+                done: done.share(),
             };
             deliveries.push((event_tx, event));
         }
@@ -1954,11 +1997,11 @@ mod flow_control_tests {
         assert!(next_changed(&mut w2).await.0.is_ok());
     }
 
-    /// Validation-error events do not gate flow control (gRFC A46/A88):
-    /// the response is NACKed, valid resources are still delivered, and a
-    /// held error token must not delay the next response.
+    /// Validation-error events gate flow control like regular updates:
+    /// the response is NACKed, valid resources are still delivered, and
+    /// holding the error token delays the next response.
     #[tokio::test]
-    async fn error_events_do_not_gate_next_response() {
+    async fn error_events_gate_next_response() {
         let (client, mut w_ok, mut server) = connected_client().await;
         let mut w_bad = watch_synced(&client, &mut server, "bad-0").await;
 
@@ -1968,7 +2011,7 @@ mod flow_control_tests {
             .unwrap();
         let (result, done_ok) = next_changed(&mut w_ok).await;
         assert!(result.is_ok());
-        let (result, _err_done) = next_changed(&mut w_bad).await;
+        let (result, err_done) = next_changed(&mut w_bad).await;
         assert!(matches!(result, Err(Error::Validation(_))));
 
         // NACK keeps the old (empty) version.
@@ -1983,7 +2026,13 @@ mod flow_control_tests {
             .responses
             .send(Ok(Some(response("2", "n2", &["res-0"]))))
             .unwrap();
-        // `_err_done` is still held; it must not gate this delivery.
+        assert_no_event(
+            &mut w_ok,
+            "response delivered while the error token was held",
+        )
+        .await;
+
+        drop(err_done);
         assert!(next_changed(&mut w_ok).await.0.is_ok());
     }
 
@@ -2043,5 +2092,70 @@ mod flow_control_tests {
             .send(Ok(Some(response("2", "n2", &["res-0", "res-1"]))))
             .unwrap();
         assert!(next_changed(&mut w1).await.0.is_ok());
+    }
+
+    /// A wildcard watcher receiving a response with more resources than
+    /// `WATCHER_CHANNEL_BUFFER_SIZE` (16) must not deadlock the worker even
+    /// before the watcher reads any events, and ADS flow control must remain
+    /// gated until all delivered tokens are dropped.
+    #[tokio::test]
+    async fn wildcard_watcher_many_resources_does_not_deadlock() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds");
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+
+        let mut watcher = client.watch::<TestResource>("").await;
+        let mut server = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("timed out waiting for stream")
+            .expect("transport dropped");
+        let _initial = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("timed out waiting for initial request")
+            .expect("stream closed");
+
+        let names: Vec<String> = (0..50).map(|i| format!("res-{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &name_refs))))
+            .unwrap();
+
+        // Wait for ACK to confirm worker processed the response.
+        let ack = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("ACK not sent")
+            .expect("stream closed");
+        assert_eq!(parse_request(&ack), ("1".to_string(), "n1".to_string()));
+
+        // Worker is not deadlocked even though 50 events were produced and none
+        // have been read from `watcher` yet: issuing a command succeeds.
+        let mut extra = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.watch::<TestResource>("extra"),
+        )
+        .await
+        .expect("worker deadlocked on full wildcard channel");
+
+        let mut dones = Vec::new();
+        for _ in 0..50 {
+            let (res, done) = next_changed(&mut watcher).await;
+            assert!(res.is_ok());
+            dones.push(done);
+        }
+
+        // Send a second response for `extra`. It should be gated until all 50 tokens drop.
+        server
+            .responses
+            .send(Ok(Some(response("2", "n2", &["extra"]))))
+            .unwrap();
+        assert_no_event(
+            &mut extra,
+            "second response delivered before all tokens dropped",
+        )
+        .await;
+
+        drop(dones);
+        assert!(next_changed(&mut extra).await.0.is_ok());
     }
 }
