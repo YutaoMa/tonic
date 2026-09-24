@@ -33,19 +33,23 @@
 use std::collections::HashSet;
 
 use protobuf::Parse;
+use xds_client::Error;
+use xds_client::Resource;
 use xds_client::resource::TypeUrl;
-use xds_client::{Error, Resource};
 
 use super::safe_regex::SafeRegex;
-use super::string_matcher::{StringMatcher, non_empty_match_value};
+use super::string_matcher::StringMatcher;
+use super::string_matcher::non_empty_match_value;
+use crate::generated::envoy::config::route::v3::HeaderMatcherView;
+use crate::generated::envoy::config::route::v3::RouteActionView;
+use crate::generated::envoy::config::route::v3::RouteConfiguration;
+use crate::generated::envoy::config::route::v3::RouteMatchView;
+use crate::generated::envoy::config::route::v3::RouteView;
+use crate::generated::envoy::config::route::v3::VirtualHostView;
 use crate::generated::envoy::config::route::v3::header_matcher::HeaderMatchSpecifierOneof;
 use crate::generated::envoy::config::route::v3::route::ActionOneof;
 use crate::generated::envoy::config::route::v3::route_action::ClusterSpecifierOneof;
 use crate::generated::envoy::config::route::v3::route_match::PathSpecifierOneof;
-use crate::generated::envoy::config::route::v3::{
-    HeaderMatcherView, RouteActionView, RouteConfiguration, RouteMatchView, RouteView,
-    VirtualHostView,
-};
 use crate::generated::envoy::r#type::v3::fractional_percent::DenominatorType;
 
 /// Validated RouteConfiguration.
@@ -506,12 +510,15 @@ impl VirtualHost {
 mod tests {
     use super::*;
     use crate::generated::envoy::config::core::v3::RuntimeFractionalPercent;
+    use crate::generated::envoy::config::route::v3::HeaderMatcher as EnvoyHeaderMatcher;
+    use crate::generated::envoy::config::route::v3::QueryParameterMatcher;
+    use crate::generated::envoy::config::route::v3::RedirectAction;
+    use crate::generated::envoy::config::route::v3::Route as EnvoyRoute;
+    use crate::generated::envoy::config::route::v3::RouteAction as EnvoyRouteAction;
+    use crate::generated::envoy::config::route::v3::RouteMatch as EnvoyRouteMatch;
+    use crate::generated::envoy::config::route::v3::VirtualHost as EnvoyVirtualHost;
+    use crate::generated::envoy::config::route::v3::WeightedCluster as EnvoyWeightedCluster;
     use crate::generated::envoy::config::route::v3::weighted_cluster::ClusterWeight;
-    use crate::generated::envoy::config::route::v3::{
-        HeaderMatcher as EnvoyHeaderMatcher, QueryParameterMatcher, RedirectAction,
-        Route as EnvoyRoute, RouteAction as EnvoyRouteAction, RouteMatch as EnvoyRouteMatch,
-        VirtualHost as EnvoyVirtualHost, WeightedCluster as EnvoyWeightedCluster,
-    };
     use crate::generated::envoy::r#type::matcher::v3::RegexMatcher;
     use crate::generated::envoy::r#type::matcher::v3::StringMatcher as EnvoyStringMatcher;
     use crate::generated::envoy::r#type::v3::FractionalPercent;

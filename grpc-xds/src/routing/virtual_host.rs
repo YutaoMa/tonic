@@ -26,7 +26,9 @@
 
 use std::cmp::Reverse;
 
-use crate::resource::{DomainMatchType, StringMatcher, VirtualHost};
+use crate::resource::DomainMatchType;
+use crate::resource::StringMatcher;
+use crate::resource::VirtualHost;
 
 /// Selects the best virtual host for the channel's data-plane authority.
 ///
@@ -244,7 +246,9 @@ mod tests {
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        use crate::resource::{ListenerResource, RouteConfigResource, RouteSource};
+        use crate::resource::ListenerResource;
+        use crate::resource::RouteConfigResource;
+        use crate::resource::RouteSource;
         use crate::xds_config::XdsConfig;
 
         let route_config = Arc::new(RouteConfigResource {
