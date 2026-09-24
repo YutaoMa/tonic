@@ -26,8 +26,7 @@
 
 use std::cmp::Reverse;
 
-use crate::matcher::{ends_with_ignore_ascii_case, starts_with_ignore_ascii_case};
-use crate::resource::{DomainMatchType, VirtualHost};
+use crate::resource::{DomainMatchType, StringMatcher, VirtualHost};
 
 /// Selects the best virtual host for the channel's data-plane authority.
 ///
@@ -60,14 +59,15 @@ impl DomainMatchType {
     /// Matches the pattern from which this match type was derived.
     fn match_domain(self, authority: &str, pattern: &str) -> Option<DomainMatchScore> {
         let matches = match self {
-            Self::Exact => authority.eq_ignore_ascii_case(pattern),
+            Self::Exact => StringMatcher::exact(pattern, true).is_match(authority),
             Self::Suffix => {
                 authority.len() >= pattern.len()
-                    && ends_with_ignore_ascii_case(authority, &pattern[1..])
+                    && StringMatcher::suffix(&pattern[1..], true).is_match(authority)
             }
             Self::Prefix => {
                 authority.len() >= pattern.len()
-                    && starts_with_ignore_ascii_case(authority, &pattern[..pattern.len() - 1])
+                    && StringMatcher::prefix(&pattern[..pattern.len() - 1], true)
+                        .is_match(authority)
             }
             Self::Universal => !authority.is_empty(),
         };

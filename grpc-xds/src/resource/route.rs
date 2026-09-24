@@ -36,7 +36,7 @@ use protobuf::Parse;
 use xds_client::resource::TypeUrl;
 use xds_client::{Error, Resource};
 
-use super::safe_regex::{SafeRegex, compile_regex};
+use super::safe_regex::SafeRegex;
 use super::string_matcher::{StringMatcher, non_empty_match_value};
 use crate::generated::envoy::config::route::v3::header_matcher::HeaderMatchSpecifierOneof;
 use crate::generated::envoy::config::route::v3::route::ActionOneof;
@@ -276,7 +276,10 @@ fn validate_route_match(rm: RouteMatchView<'_>) -> xds_client::Result<RouteMatch
         PathSpecifierOneof::SafeRegex(r) => {
             let pattern = r.regex();
             let pattern = pattern.to_str().unwrap_or_default();
-            PathSpecifier::SafeRegex(compile_regex(pattern, "path")?)
+            let regex = pattern
+                .parse()
+                .map_err(|e| Error::Validation(format!("invalid path regex '{pattern}': {e}")))?;
+            PathSpecifier::SafeRegex(regex)
         }
         // Per A28: not having path_specifier will cause a NACK.
         PathSpecifierOneof::not_set(_) => {
@@ -346,16 +349,21 @@ fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<Head
     #[allow(deprecated, unreachable_patterns)]
     let match_specifier = match hm.header_match_specifier() {
         HeaderMatchSpecifierOneof::ExactMatch(v) => {
+            let value = v.to_str().map_err(|e| {
+                Error::Validation(format!("invalid UTF-8 in exact header matcher: {e}"))
+            })?;
             HeaderMatchSpecifier::String(StringMatcher::Exact {
-                value: v.to_str().unwrap_or_default().to_string(),
+                value: value.to_string(),
                 ignore_case: false,
             })
         }
         HeaderMatchSpecifierOneof::SafeRegexMatch(r) => {
             let pattern = r.regex();
-            let pattern = pattern.to_str().unwrap_or_default();
-            HeaderMatchSpecifier::String(StringMatcher::SafeRegex(compile_regex(
-                pattern, "header",
+            let pattern = pattern
+                .to_str()
+                .map_err(|e| Error::Validation(format!("invalid UTF-8 in header regex: {e}")))?;
+            HeaderMatchSpecifier::String(StringMatcher::SafeRegex(pattern.parse().map_err(
+                |e| Error::Validation(format!("invalid header regex '{pattern}': {e}")),
             )?))
         }
         HeaderMatchSpecifierOneof::RangeMatch(r) => HeaderMatchSpecifier::Range {
@@ -370,20 +378,29 @@ fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<Head
             }
         }
         HeaderMatchSpecifierOneof::PrefixMatch(v) => {
+            let value = v.to_str().map_err(|e| {
+                Error::Validation(format!("invalid UTF-8 in prefix header matcher: {e}"))
+            })?;
             HeaderMatchSpecifier::String(StringMatcher::Prefix {
-                value: non_empty_match_value(v.to_str().unwrap_or_default(), "prefix")?,
+                value: non_empty_match_value(value, "prefix")?,
                 ignore_case: false,
             })
         }
         HeaderMatchSpecifierOneof::SuffixMatch(v) => {
+            let value = v.to_str().map_err(|e| {
+                Error::Validation(format!("invalid UTF-8 in suffix header matcher: {e}"))
+            })?;
             HeaderMatchSpecifier::String(StringMatcher::Suffix {
-                value: non_empty_match_value(v.to_str().unwrap_or_default(), "suffix")?,
+                value: non_empty_match_value(value, "suffix")?,
                 ignore_case: false,
             })
         }
         HeaderMatchSpecifierOneof::ContainsMatch(v) => {
+            let value = v.to_str().map_err(|e| {
+                Error::Validation(format!("invalid UTF-8 in contains header matcher: {e}"))
+            })?;
             HeaderMatchSpecifier::String(StringMatcher::Contains {
-                value: non_empty_match_value(v.to_str().unwrap_or_default(), "contains")?,
+                value: non_empty_match_value(value, "contains")?,
                 ignore_case: false,
             })
         }
@@ -893,6 +910,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_header_patterns_reject_invalid_utf8() {
+        for bytes in [
+            b"\xff".as_slice(),
+            b"valid\xff".as_slice(),
+            b"\xc3".as_slice(),
+        ] {
+            for (kind, field) in [
+                ("exact", "exact header matcher"),
+                ("prefix", "prefix header matcher"),
+                ("suffix", "suffix header matcher"),
+                ("contains", "contains header matcher"),
+                ("regex", "header regex"),
+            ] {
+                let value = protobuf::ProtoStr::from_utf8_unchecked(bytes);
+                let mut header = EnvoyHeaderMatcher::new();
+                header.set_name("x-test");
+                match kind {
+                    "exact" => header.set_exact_match(value),
+                    "prefix" => header.set_prefix_match(value),
+                    "suffix" => header.set_suffix_match(value),
+                    "contains" => header.set_contains_match(value),
+                    "regex" => {
+                        let mut regex = RegexMatcher::new();
+                        regex.set_regex(value);
+                        header.set_safe_regex_match(regex);
+                    }
+                    _ => panic!("unknown matcher kind"),
+                }
+                let Error::Validation(message) =
+                    RouteConfigResource::validate(route_config_with_header(header)).unwrap_err()
+                else {
+                    panic!("expected a validation error");
+                };
+                assert!(
+                    message.starts_with(&format!("invalid UTF-8 in {field}:")),
+                    "{kind}, {bytes:?}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_legacy_exact_header_matcher_preserves_empty_and_utf8_values() {
+        for value in ["", "caf\u{e9}"] {
+            let mut header = EnvoyHeaderMatcher::new();
+            header.set_name("x-test");
+            header.set_exact_match(value);
+
+            let HeaderMatchSpecifier::String(matcher) = validate_header(header) else {
+                panic!("expected a string matcher");
+            };
+            assert!(matcher.is_match(value));
+            assert!(!matcher.is_match(&format!("{value}suffix")));
+        }
+    }
+
+    #[test]
     fn validate_legacy_prefix_header_matcher() {
         let mut header = EnvoyHeaderMatcher::new();
         header.set_name("x-tenant");
@@ -1039,14 +1113,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_path_regex() {
-        let mut regex = RegexMatcher::new();
-        regex.set_regex("");
-        let mut route_match = EnvoyRouteMatch::new();
-        route_match.set_safe_regex(regex);
+    fn validate_path_regex_errors_preserve_context() {
+        for (pattern, reason) in [
+            ("", "empty regex is not allowed"),
+            ("[", "unclosed character class"),
+        ] {
+            let mut regex = RegexMatcher::new();
+            regex.set_regex(pattern);
+            let mut route_match = EnvoyRouteMatch::new();
+            route_match.set_safe_regex(regex);
 
-        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
-        assert!(err.to_string().contains("empty path regex"));
+            let Error::Validation(message) =
+                RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err()
+            else {
+                panic!("expected a validation error");
+            };
+            assert!(
+                message.starts_with(&format!("invalid path regex '{pattern}':")),
+                "{message}"
+            );
+            assert!(message.contains(reason), "{message}");
+        }
     }
 
     #[test]
@@ -1088,19 +1175,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_header_regex() {
-        let mut regex = RegexMatcher::new();
-        regex.set_regex("");
-        let mut header = EnvoyHeaderMatcher::new();
-        header.set_name("x-test");
-        header.set_safe_regex_match(regex);
+    fn validate_header_regex_errors_preserve_context() {
+        for (pattern, reason) in [
+            ("", "empty regex is not allowed"),
+            ("[", "unclosed character class"),
+        ] {
+            let mut regex = RegexMatcher::new();
+            regex.set_regex(pattern);
+            let mut header = EnvoyHeaderMatcher::new();
+            header.set_name("x-test");
+            header.set_safe_regex_match(regex);
 
-        let mut route_match = EnvoyRouteMatch::new();
-        route_match.set_prefix("/");
-        route_match.headers_mut().push(header);
+            let mut route_match = EnvoyRouteMatch::new();
+            route_match.set_prefix("/");
+            route_match.headers_mut().push(header);
 
-        let err = RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err();
-        assert!(err.to_string().contains("empty header regex"));
+            let Error::Validation(message) =
+                RouteConfigResource::validate(route_config_with_match(route_match)).unwrap_err()
+            else {
+                panic!("expected a validation error");
+            };
+            assert!(
+                message.starts_with(&format!("invalid header regex '{pattern}':")),
+                "{message}"
+            );
+            assert!(message.contains(reason), "{message}");
+        }
     }
 
     #[test]

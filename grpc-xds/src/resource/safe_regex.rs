@@ -25,26 +25,37 @@
 //! Validated full-string regex for `envoy.type.matcher.v3.RegexMatcher`.
 
 use std::fmt;
+use std::str::FromStr;
 
 use regex::Regex;
-use xds_client::Error;
 
 const ANCHOR_PREFIX: &str = r"\A(?:";
 const ANCHOR_SUFFIX: &str = r")\z";
 
 /// A regex that can only match an entire input, as required by Envoy.
+///
+/// Parses a nonempty `RegexMatcher` pattern via [`FromStr`].
 #[derive(Clone)]
 pub(crate) struct SafeRegex(Regex);
 
-impl SafeRegex {
-    fn new(pattern: &str) -> Result<Self, regex::Error> {
+impl FromStr for SafeRegex {
+    type Err = String;
+
+    fn from_str(pattern: &str) -> Result<Self, Self::Err> {
+        if pattern.is_empty() {
+            return Err("empty regex is not allowed".into());
+        }
         // Validate before wrapping: an unmatched ')' must not be able to close
         // our group and introduce an unanchored alternative.
-        Regex::new(pattern)?;
+        Regex::new(pattern).map_err(|e| e.to_string())?;
         // The group binds all alternatives; \A and \z also resist multiline flags.
-        Regex::new(&format!("{ANCHOR_PREFIX}{pattern}{ANCHOR_SUFFIX}")).map(Self)
+        Regex::new(&format!("{ANCHOR_PREFIX}{pattern}{ANCHOR_SUFFIX}"))
+            .map(Self)
+            .map_err(|e| e.to_string())
     }
+}
 
+impl SafeRegex {
     pub(crate) fn is_match(&self, value: &str) -> bool {
         self.0.is_match(value)
     }
@@ -56,17 +67,6 @@ impl fmt::Debug for SafeRegex {
         let pattern = &anchored[ANCHOR_PREFIX.len()..anchored.len() - ANCHOR_SUFFIX.len()];
         f.debug_tuple("SafeRegex").field(&pattern).finish()
     }
-}
-
-/// Compiles a `RegexMatcher` pattern, rejecting the empty pattern.
-pub(crate) fn compile_regex(pattern: &str, kind: &str) -> xds_client::Result<SafeRegex> {
-    if pattern.is_empty() {
-        return Err(Error::Validation(format!(
-            "empty {kind} regex is not allowed"
-        )));
-    }
-    SafeRegex::new(pattern)
-        .map_err(|e| Error::Validation(format!("invalid {kind} regex '{pattern}': {e}")))
 }
 
 #[cfg(test)]
@@ -96,7 +96,7 @@ mod tests {
             ("/caf\u{e9}/.*", "/caf\u{e9}/x", "x/caf\u{e9}/x"),
             (".*", "", "a\nb"),
         ] {
-            let matcher = compile_regex(pattern, "test").unwrap();
+            let matcher = pattern.parse::<SafeRegex>().unwrap();
             assert!(matcher.is_match(accepted), "{pattern:?}: {accepted:?}");
             assert!(!matcher.is_match(rejected), "{pattern:?}: {rejected:?}");
         }
@@ -105,32 +105,35 @@ mod tests {
     #[test]
     fn invalid_patterns_cannot_escape_the_anchors() {
         for pattern in ["(unclosed", "foo)|bar(?:", "foo)(?:bar", ")(?:", r")\"] {
-            assert!(compile_regex(pattern, "test").is_err(), "{pattern:?}");
+            assert!(pattern.parse::<SafeRegex>().is_err(), "{pattern:?}");
         }
     }
 
     #[test]
     fn inline_comments_cannot_remove_the_anchors() {
-        assert!(compile_regex("(?x)#", "test").is_err());
+        assert!("(?x)#".parse::<SafeRegex>().is_err());
     }
 
     #[test]
-    fn compile_errors_preserve_resource_context() {
-        for kind in ["path", "header", "string matcher"] {
-            let empty = compile_regex("", kind).unwrap_err();
-            assert!(empty.to_string().contains(&format!("empty {kind} regex")));
-            let invalid = compile_regex("[", kind).unwrap_err();
-            assert!(
-                invalid
-                    .to_string()
-                    .contains(&format!("invalid {kind} regex"))
-            );
-        }
+    fn parse_rejects_empty_patterns() {
+        assert_eq!(
+            "".parse::<SafeRegex>().unwrap_err(),
+            "empty regex is not allowed"
+        );
+    }
+
+    #[test]
+    fn parse_preserves_regex_errors() {
+        let pattern = "[";
+        assert_eq!(
+            pattern.parse::<SafeRegex>().unwrap_err(),
+            Regex::new(pattern).unwrap_err().to_string()
+        );
     }
 
     #[test]
     fn debug_reports_the_original_pattern() {
-        let matcher = compile_regex("/caf\u{e9}/a|/b", "test").unwrap();
+        let matcher = "/caf\u{e9}/a|/b".parse::<SafeRegex>().unwrap();
         assert_eq!(format!("{matcher:?}"), "SafeRegex(\"/caf\u{e9}/a|/b\")");
     }
 }
