@@ -32,8 +32,8 @@ use crate::generated::envoy::r#type::matcher::v3::string_matcher::MatchPatternOn
 
 /// An owned `envoy.type.matcher.v3.StringMatcher`.
 ///
-/// [`Self::from_proto`] validates protobuf input. Literal constructors perform
-/// no validation; callers must enforce any context-specific restrictions.
+/// Constructors reject non-Envoy-spec-compliant values, including
+/// empty prefix, suffix, and contains values.
 #[derive(Debug, Clone)]
 pub(crate) enum StringMatcher {
     Exact { value: String, ignore_case: bool },
@@ -44,7 +44,7 @@ pub(crate) enum StringMatcher {
 }
 
 impl StringMatcher {
-    /// Matches inputs equal to `value`.
+    /// Matches inputs equal to `value`, ignoring ASCII case if `ignore_case`.
     pub(crate) fn exact(value: impl Into<String>, ignore_case: bool) -> Self {
         Self::Exact {
             value: value.into(),
@@ -52,76 +52,88 @@ impl StringMatcher {
         }
     }
 
-    /// Matches inputs starting with `value`.
-    pub(crate) fn prefix(value: impl Into<String>, ignore_case: bool) -> Self {
-        Self::Prefix {
-            value: value.into(),
+    /// Matches inputs starting with `value`, ignoring ASCII case if `ignore_case`.
+    ///
+    /// Returns a validation error if `value` is empty.
+    pub(crate) fn prefix(value: impl Into<String>, ignore_case: bool) -> xds_client::Result<Self> {
+        Ok(Self::Prefix {
+            value: non_empty_match_value(value.into(), "prefix")?,
             ignore_case,
-        }
+        })
     }
 
-    /// Matches inputs ending with `value`.
-    pub(crate) fn suffix(value: impl Into<String>, ignore_case: bool) -> Self {
-        Self::Suffix {
-            value: value.into(),
+    /// Matches inputs ending with `value`, ignoring ASCII case if `ignore_case`.
+    ///
+    /// Returns a validation error if `value` is empty.
+    pub(crate) fn suffix(value: impl Into<String>, ignore_case: bool) -> xds_client::Result<Self> {
+        Ok(Self::Suffix {
+            value: non_empty_match_value(value.into(), "suffix")?,
             ignore_case,
-        }
+        })
     }
 
-    /// Matches inputs containing `value`.
-    pub(crate) fn contains(value: impl Into<String>, ignore_case: bool) -> Self {
-        Self::Contains {
-            value: value.into(),
-            ignore_case,
+    /// Matches inputs containing `value`, ignoring ASCII case if `ignore_case`
+    /// (`value` is then stored ASCII-lowercased).
+    ///
+    /// Returns a validation error if `value` is empty.
+    pub(crate) fn contains(
+        value: impl Into<String>,
+        ignore_case: bool,
+    ) -> xds_client::Result<Self> {
+        let mut value = non_empty_match_value(value.into(), "contains")?;
+        if ignore_case {
+            // Folded once here so matching is a linear search over the folded input.
+            value.make_ascii_lowercase();
         }
+        Ok(Self::Contains { value, ignore_case })
     }
 
     /// Parses and validates an `envoy.type.matcher.v3.StringMatcher`.
     ///
+    /// As in Envoy, `ignore_case` applies only to literal patterns, not to
+    /// `safe_regex`.
+    ///
     /// Returns an error if the `match_pattern` oneof is unset or carries an
-    /// unsupported variant, a pattern contains invalid UTF-8, a
-    /// prefix/suffix/contains value is empty, or a `safe_regex` fails to compile.
+    /// unsupported variant, a prefix/suffix/contains value is empty, or a
+    /// `safe_regex` fails to compile.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a pattern is not valid UTF-8. This is not expected in
+    /// practice; xDS resource parsing will later convert such panics into
+    /// validation errors.
     pub(crate) fn from_proto(proto: StringMatcherView<'_>) -> xds_client::Result<Self> {
         let ignore_case = proto.ignore_case();
         match proto.match_pattern() {
             MatchPatternOneof::Exact(value) => {
-                let value = value.to_str().map_err(|e| {
-                    Error::Validation(format!("invalid UTF-8 in exact string matcher: {e}"))
-                })?;
+                let value = value
+                    .to_str()
+                    .expect("exact string matcher should be valid UTF-8");
                 Ok(Self::exact(value, ignore_case))
             }
             MatchPatternOneof::Prefix(value) => {
-                let value = value.to_str().map_err(|e| {
-                    Error::Validation(format!("invalid UTF-8 in prefix string matcher: {e}"))
-                })?;
-                Ok(Self::prefix(
-                    non_empty_match_value(value, "prefix")?,
-                    ignore_case,
-                ))
+                let value = value
+                    .to_str()
+                    .expect("prefix string matcher should be valid UTF-8");
+                Self::prefix(value, ignore_case)
             }
             MatchPatternOneof::Suffix(value) => {
-                let value = value.to_str().map_err(|e| {
-                    Error::Validation(format!("invalid UTF-8 in suffix string matcher: {e}"))
-                })?;
-                Ok(Self::suffix(
-                    non_empty_match_value(value, "suffix")?,
-                    ignore_case,
-                ))
+                let value = value
+                    .to_str()
+                    .expect("suffix string matcher should be valid UTF-8");
+                Self::suffix(value, ignore_case)
             }
             MatchPatternOneof::Contains(value) => {
-                let value = value.to_str().map_err(|e| {
-                    Error::Validation(format!("invalid UTF-8 in contains string matcher: {e}"))
-                })?;
-                Ok(Self::contains(
-                    non_empty_match_value(value, "contains")?,
-                    ignore_case,
-                ))
+                let value = value
+                    .to_str()
+                    .expect("contains string matcher should be valid UTF-8");
+                Self::contains(value, ignore_case)
             }
             MatchPatternOneof::SafeRegex(r) => {
                 let pattern = r.regex();
-                let pattern = pattern.to_str().map_err(|e| {
-                    Error::Validation(format!("invalid UTF-8 in string matcher regex: {e}"))
-                })?;
+                let pattern = pattern
+                    .to_str()
+                    .expect("string matcher regex should be valid UTF-8");
                 Ok(Self::SafeRegex(pattern.parse().map_err(|e| {
                     Error::Validation(format!("invalid string matcher regex '{pattern}': {e}"))
                 })?))
@@ -135,8 +147,8 @@ impl StringMatcher {
         }
     }
 
-    /// `ignore_case` uses ASCII case folding and does not affect regexes.
-    /// Literal patterns never interpret wildcards.
+    /// Returns whether `input` matches. Literal values are compared verbatim
+    /// (`*` is not a wildcard); regexes must match the entire input.
     pub(crate) fn is_match(&self, input: &str) -> bool {
         match self {
             Self::Exact { value, ignore_case } => {
@@ -162,9 +174,9 @@ impl StringMatcher {
             }
             Self::Contains { value, ignore_case } => {
                 if *ignore_case {
-                    contains_ignore_ascii_case(input, value)
+                    input.to_ascii_lowercase().contains(value.as_str())
                 } else {
-                    input.contains(value)
+                    input.contains(value.as_str())
                 }
             }
             Self::SafeRegex(regex) => regex.is_match(input),
@@ -172,13 +184,13 @@ impl StringMatcher {
     }
 }
 
-pub(crate) fn non_empty_match_value(value: &str, kind: &str) -> xds_client::Result<String> {
+fn non_empty_match_value(value: String, kind: &str) -> xds_client::Result<String> {
     if value.is_empty() {
         return Err(Error::Validation(format!(
             "empty {kind} match is not allowed"
         )));
     }
-    Ok(value.to_string())
+    Ok(value)
 }
 
 fn starts_with_ignore_ascii_case(input: &str, prefix: &str) -> bool {
@@ -195,16 +207,11 @@ fn ends_with_ignore_ascii_case(input: &str, suffix: &str) -> bool {
         .is_some_and(|start| input.as_bytes()[start..].eq_ignore_ascii_case(suffix.as_bytes()))
 }
 
-fn contains_ignore_ascii_case(input: &str, pattern: &str) -> bool {
-    let (input, pattern) = (input.as_bytes(), pattern.as_bytes());
-    let Some(max_start) = input.len().checked_sub(pattern.len()) else {
-        return false;
-    };
-    (0..=max_start).any(|i| input[i..i + pattern.len()].eq_ignore_ascii_case(pattern))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+
     use super::*;
     use crate::generated::envoy::r#type::matcher::v3::StringMatcher as EnvoyStringMatcher;
 
@@ -227,31 +234,27 @@ mod tests {
     }
 
     #[test]
-    fn generic_patterns_reject_invalid_utf8() {
-        for bytes in [
-            b"\xff".as_slice(),
-            b"valid\xff".as_slice(),
-            b"\xc3".as_slice(),
+    fn generic_patterns_panic_on_invalid_utf8() {
+        let value = protobuf::ProtoStr::from_utf8_unchecked(b"\xff");
+        for (kind, field) in [
+            ("exact", "exact string matcher"),
+            ("prefix", "prefix string matcher"),
+            ("suffix", "suffix string matcher"),
+            ("contains", "contains string matcher"),
+            ("regex", "string matcher regex"),
         ] {
-            for (kind, field) in [
-                ("exact", "exact string matcher"),
-                ("prefix", "prefix string matcher"),
-                ("suffix", "suffix string matcher"),
-                ("contains", "contains string matcher"),
-                ("regex", "string matcher regex"),
-            ] {
-                let value = protobuf::ProtoStr::from_utf8_unchecked(bytes);
-                let proto = proto(kind, value, false);
-                let Error::Validation(message) =
-                    StringMatcher::from_proto(proto.as_view()).unwrap_err()
-                else {
-                    panic!("expected a validation error");
-                };
-                assert!(
-                    message.starts_with(&format!("invalid UTF-8 in {field}:")),
-                    "{kind}, {bytes:?}: {message}"
-                );
-            }
+            let proto = proto(kind, value, false);
+            let payload = catch_unwind(AssertUnwindSafe(|| {
+                StringMatcher::from_proto(proto.as_view())
+            }))
+            .expect_err("expected a panic");
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("panic message should be a String");
+            assert!(
+                message.starts_with(&format!("{field} should be valid UTF-8:")),
+                "{kind}: {message}"
+            );
         }
     }
 
@@ -274,6 +277,23 @@ mod tests {
         ] {
             let err = StringMatcher::from_proto(proto.as_view()).unwrap_err();
             assert!(err.to_string().contains("empty"), "{kind}: {err}");
+        }
+    }
+
+    #[test]
+    fn constructors_reject_empty_non_exact_values() {
+        for ignore_case in [false, true] {
+            for (kind, result) in [
+                ("prefix", StringMatcher::prefix("", ignore_case)),
+                ("suffix", StringMatcher::suffix("", ignore_case)),
+                ("contains", StringMatcher::contains("", ignore_case)),
+            ] {
+                let Error::Validation(message) = result.unwrap_err() else {
+                    panic!("expected a validation error");
+                };
+                assert_eq!(message, format!("empty {kind} match is not allowed"));
+            }
+            assert!(StringMatcher::exact("", ignore_case).is_match(""));
         }
     }
 
@@ -322,19 +342,19 @@ mod tests {
                 ),
                 (
                     "prefix",
-                    StringMatcher::prefix("Foo", ignore_case),
+                    StringMatcher::prefix("Foo", ignore_case).unwrap(),
                     "FooBar",
                     "BarFoo",
                 ),
                 (
                     "suffix",
-                    StringMatcher::suffix("Foo", ignore_case),
+                    StringMatcher::suffix("Foo", ignore_case).unwrap(),
                     "BarFoo",
                     "FooBar",
                 ),
                 (
                     "contains",
-                    StringMatcher::contains("Foo", ignore_case),
+                    StringMatcher::contains("Foo", ignore_case).unwrap(),
                     "xFooBar",
                     "Bar",
                 ),
@@ -367,7 +387,9 @@ mod tests {
         }
         assert!(!starts_with_ignore_ascii_case("\u{e9}", "a"));
         assert!(!ends_with_ignore_ascii_case("\u{e9}", "a"));
-        assert!(contains_ignore_ascii_case("\u{1f600}AbC\u{e9}", "abc"));
+        let contains = StringMatcher::contains("aBc", true).unwrap();
+        assert!(contains.is_match("\u{1f600}AbC\u{e9}"));
+        assert!(!contains.is_match("\u{1f600}Ab\u{e9}C"));
     }
 
     #[test]

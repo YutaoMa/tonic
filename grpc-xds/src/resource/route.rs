@@ -39,7 +39,6 @@ use xds_client::resource::TypeUrl;
 
 use super::safe_regex::SafeRegex;
 use super::string_matcher::StringMatcher;
-use super::string_matcher::non_empty_match_value;
 use crate::generated::envoy::config::route::v3::HeaderMatcherView;
 use crate::generated::envoy::config::route::v3::RouteActionView;
 use crate::generated::envoy::config::route::v3::RouteConfiguration;
@@ -63,16 +62,24 @@ pub(crate) struct RouteConfigResource {
 #[derive(Debug, Clone)]
 pub(crate) struct VirtualHost {
     pub(crate) name: String,
-    pub(crate) domains: Vec<String>,
+    pub(crate) domains: Vec<DomainMatcher>,
     pub(crate) routes: Vec<Route>,
 }
 
-/// Classification of a valid virtual-host domain pattern, in match-precedence order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum DomainMatchType {
-    Exact,
-    Suffix,
-    Prefix,
+/// A validated virtual-host domain pattern (gRFC A27).
+///
+/// Built with [`DomainMatcher::try_from`], which lowercases the domain and
+/// removes the `*`, so the stored literal is ASCII lowercase and, for
+/// wildcard variants, non-empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DomainMatcher {
+    /// `example.com`
+    Exact(String),
+    /// `*.example.com`, stored as `.example.com`.
+    Suffix(String),
+    /// `example.*`, stored as `example.`.
+    Prefix(String),
+    /// `*`
     Universal,
 }
 
@@ -80,18 +87,21 @@ pub(crate) enum DomainMatchType {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct InvalidDomainPattern;
 
-impl TryFrom<&str> for DomainMatchType {
+impl TryFrom<&str> for DomainMatcher {
     type Error = InvalidDomainPattern;
 
-    fn try_from(pattern: &str) -> Result<Self, Self::Error> {
-        if pattern.is_empty() {
+    fn try_from(domain: &str) -> Result<Self, Self::Error> {
+        if domain.is_empty() {
             return Err(InvalidDomainPattern);
         }
-        match pattern.find('*') {
-            None => Ok(Self::Exact),
-            Some(0) if pattern.len() == 1 => Ok(Self::Universal),
-            Some(0) if !pattern[1..].contains('*') => Ok(Self::Suffix),
-            Some(index) if index == pattern.len() - 1 => Ok(Self::Prefix),
+        let domain = domain.to_ascii_lowercase();
+        match domain.find('*') {
+            None => Ok(Self::Exact(domain)),
+            Some(0) if domain.len() == 1 => Ok(Self::Universal),
+            Some(0) if !domain[1..].contains('*') => Ok(Self::Suffix(domain[1..].to_string())),
+            Some(index) if index == domain.len() - 1 => {
+                Ok(Self::Prefix(domain[..index].to_string()))
+            }
             _ => Err(InvalidDomainPattern),
         }
     }
@@ -210,13 +220,16 @@ fn validate_virtual_host(vh: VirtualHostView<'_>) -> xds_client::Result<VirtualH
     let domains = domains_view
         .iter()
         .map(|d| {
-            let domain = d.to_str().unwrap_or_default();
-            DomainMatchType::try_from(domain).map_err(|_| {
+            // Invalid UTF-8 is not expected in practice; xDS resource parsing
+            // will later convert panics like this into validation errors.
+            let domain = d
+                .to_str()
+                .expect("virtual host domain should be valid UTF-8");
+            DomainMatcher::try_from(domain).map_err(|_| {
                 Error::Validation(format!(
                     "invalid domain pattern '{domain}' in virtual host '{name}'"
                 ))
-            })?;
-            Ok(domain.to_string())
+            })
         })
         .collect::<xds_client::Result<Vec<_>>>()?;
 
@@ -350,22 +363,21 @@ fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<Head
 
     // Legacy matchers are deprecated in favor of StringMatch but remain
     // widely used and are still required by gRFC A63.
+    // Invalid UTF-8 is not expected in practice; xDS resource parsing will
+    // later convert the `expect` panics below into validation errors.
     #[allow(deprecated, unreachable_patterns)]
     let match_specifier = match hm.header_match_specifier() {
         HeaderMatchSpecifierOneof::ExactMatch(v) => {
-            let value = v.to_str().map_err(|e| {
-                Error::Validation(format!("invalid UTF-8 in exact header matcher: {e}"))
-            })?;
-            HeaderMatchSpecifier::String(StringMatcher::Exact {
-                value: value.to_string(),
-                ignore_case: false,
-            })
+            let value = v
+                .to_str()
+                .expect("exact header matcher should be valid UTF-8");
+            HeaderMatchSpecifier::String(StringMatcher::exact(value, false))
         }
         HeaderMatchSpecifierOneof::SafeRegexMatch(r) => {
             let pattern = r.regex();
             let pattern = pattern
                 .to_str()
-                .map_err(|e| Error::Validation(format!("invalid UTF-8 in header regex: {e}")))?;
+                .expect("header regex should be valid UTF-8");
             HeaderMatchSpecifier::String(StringMatcher::SafeRegex(pattern.parse().map_err(
                 |e| Error::Validation(format!("invalid header regex '{pattern}': {e}")),
             )?))
@@ -382,31 +394,22 @@ fn validate_header_matcher(hm: HeaderMatcherView<'_>) -> xds_client::Result<Head
             }
         }
         HeaderMatchSpecifierOneof::PrefixMatch(v) => {
-            let value = v.to_str().map_err(|e| {
-                Error::Validation(format!("invalid UTF-8 in prefix header matcher: {e}"))
-            })?;
-            HeaderMatchSpecifier::String(StringMatcher::Prefix {
-                value: non_empty_match_value(value, "prefix")?,
-                ignore_case: false,
-            })
+            let value = v
+                .to_str()
+                .expect("prefix header matcher should be valid UTF-8");
+            HeaderMatchSpecifier::String(StringMatcher::prefix(value, false)?)
         }
         HeaderMatchSpecifierOneof::SuffixMatch(v) => {
-            let value = v.to_str().map_err(|e| {
-                Error::Validation(format!("invalid UTF-8 in suffix header matcher: {e}"))
-            })?;
-            HeaderMatchSpecifier::String(StringMatcher::Suffix {
-                value: non_empty_match_value(value, "suffix")?,
-                ignore_case: false,
-            })
+            let value = v
+                .to_str()
+                .expect("suffix header matcher should be valid UTF-8");
+            HeaderMatchSpecifier::String(StringMatcher::suffix(value, false)?)
         }
         HeaderMatchSpecifierOneof::ContainsMatch(v) => {
-            let value = v.to_str().map_err(|e| {
-                Error::Validation(format!("invalid UTF-8 in contains header matcher: {e}"))
-            })?;
-            HeaderMatchSpecifier::String(StringMatcher::Contains {
-                value: non_empty_match_value(value, "contains")?,
-                ignore_case: false,
-            })
+            let value = v
+                .to_str()
+                .expect("contains header matcher should be valid UTF-8");
+            HeaderMatchSpecifier::String(StringMatcher::contains(value, false)?)
         }
         HeaderMatchSpecifierOneof::StringMatch(sm) => {
             HeaderMatchSpecifier::String(StringMatcher::from_proto(sm)?)
@@ -508,6 +511,9 @@ impl VirtualHost {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::AssertUnwindSafe;
+    use std::panic::catch_unwind;
+
     use super::*;
     use crate::generated::envoy::config::core::v3::RuntimeFractionalPercent;
     use crate::generated::envoy::config::route::v3::HeaderMatcher as EnvoyHeaderMatcher;
@@ -656,26 +662,30 @@ mod tests {
 
     #[test]
     fn invalid_domain_patterns_fail_conversion() {
-        for pattern in ["", "a*b.example.com", "**", "*foo*", "foo**", "*foo*bar"] {
+        for domain in ["", "a*b.example.com", "**", "*foo*", "foo**", "*foo*bar"] {
             assert_eq!(
-                DomainMatchType::try_from(pattern),
+                DomainMatcher::try_from(domain),
                 Err(InvalidDomainPattern),
-                "{pattern:?}",
+                "{domain:?}",
             );
         }
     }
 
     #[test]
-    fn domain_patterns_convert_to_their_match_type() {
-        for (pattern, expected) in [
-            ("example.com", DomainMatchType::Exact),
-            ("*", DomainMatchType::Universal),
-            ("*.example.com", DomainMatchType::Suffix),
-            ("*-foo", DomainMatchType::Suffix),
-            ("foo.*", DomainMatchType::Prefix),
-            ("foo-*", DomainMatchType::Prefix),
+    fn domain_patterns_convert_to_lowercase_matchers_without_wildcards() {
+        for (domain, expected) in [
+            ("example.com", DomainMatcher::Exact("example.com".into())),
+            ("Example.COM", DomainMatcher::Exact("example.com".into())),
+            ("*", DomainMatcher::Universal),
+            (
+                "*.Example.com",
+                DomainMatcher::Suffix(".example.com".into()),
+            ),
+            ("*-foo", DomainMatcher::Suffix("-foo".into())),
+            ("FOO.*", DomainMatcher::Prefix("foo.".into())),
+            ("foo-*", DomainMatcher::Prefix("foo-".into())),
         ] {
-            assert_eq!(pattern.try_into(), Ok(expected), "{pattern:?}");
+            assert_eq!(DomainMatcher::try_from(domain), Ok(expected), "{domain:?}");
         }
     }
 
@@ -699,7 +709,10 @@ mod tests {
         rc.virtual_hosts_mut().push(host);
 
         let validated = RouteConfigResource::validate(rc).unwrap();
-        assert_eq!(validated.virtual_hosts[1].domains, domains);
+        assert_eq!(
+            validated.virtual_hosts[1].domains,
+            domains.map(|domain| DomainMatcher::try_from(domain).unwrap()),
+        );
     }
 
     #[test]
@@ -917,44 +930,52 @@ mod tests {
     }
 
     #[test]
-    fn legacy_header_patterns_reject_invalid_utf8() {
-        for bytes in [
-            b"\xff".as_slice(),
-            b"valid\xff".as_slice(),
-            b"\xc3".as_slice(),
+    #[should_panic = "virtual host domain should be valid UTF-8"]
+    fn invalid_utf8_domain_panics() {
+        let mut host = EnvoyVirtualHost::new();
+        host.set_name("host");
+        host.domains_mut()
+            .push(protobuf::ProtoStr::from_utf8_unchecked(b"\xff"));
+        let mut rc = make_route_config("rc-1");
+        rc.virtual_hosts_mut().push(host);
+
+        let _ = RouteConfigResource::validate(rc);
+    }
+
+    #[test]
+    fn legacy_header_patterns_panic_on_invalid_utf8() {
+        let value = protobuf::ProtoStr::from_utf8_unchecked(b"\xff");
+        for (kind, field) in [
+            ("exact", "exact header matcher"),
+            ("prefix", "prefix header matcher"),
+            ("suffix", "suffix header matcher"),
+            ("contains", "contains header matcher"),
+            ("regex", "header regex"),
         ] {
-            for (kind, field) in [
-                ("exact", "exact header matcher"),
-                ("prefix", "prefix header matcher"),
-                ("suffix", "suffix header matcher"),
-                ("contains", "contains header matcher"),
-                ("regex", "header regex"),
-            ] {
-                let value = protobuf::ProtoStr::from_utf8_unchecked(bytes);
-                let mut header = EnvoyHeaderMatcher::new();
-                header.set_name("x-test");
-                match kind {
-                    "exact" => header.set_exact_match(value),
-                    "prefix" => header.set_prefix_match(value),
-                    "suffix" => header.set_suffix_match(value),
-                    "contains" => header.set_contains_match(value),
-                    "regex" => {
-                        let mut regex = RegexMatcher::new();
-                        regex.set_regex(value);
-                        header.set_safe_regex_match(regex);
-                    }
-                    _ => panic!("unknown matcher kind"),
+            let mut header = EnvoyHeaderMatcher::new();
+            header.set_name("x-test");
+            match kind {
+                "exact" => header.set_exact_match(value),
+                "prefix" => header.set_prefix_match(value),
+                "suffix" => header.set_suffix_match(value),
+                "contains" => header.set_contains_match(value),
+                "regex" => {
+                    let mut regex = RegexMatcher::new();
+                    regex.set_regex(value);
+                    header.set_safe_regex_match(regex);
                 }
-                let Error::Validation(message) =
-                    RouteConfigResource::validate(route_config_with_header(header)).unwrap_err()
-                else {
-                    panic!("expected a validation error");
-                };
-                assert!(
-                    message.starts_with(&format!("invalid UTF-8 in {field}:")),
-                    "{kind}, {bytes:?}: {message}"
-                );
+                _ => panic!("unknown matcher kind"),
             }
+            let rc = route_config_with_header(header);
+            let payload = catch_unwind(AssertUnwindSafe(|| RouteConfigResource::validate(rc)))
+                .expect_err("expected a panic");
+            let message = payload
+                .downcast_ref::<String>()
+                .expect("panic message should be a String");
+            assert!(
+                message.starts_with(&format!("{field} should be valid UTF-8:")),
+                "{kind}: {message}"
+            );
         }
     }
 

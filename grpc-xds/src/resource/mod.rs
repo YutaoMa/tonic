@@ -49,7 +49,7 @@ pub(crate) use endpoint::Locality;
 pub(crate) use endpoint::LocalityLbEndpoints;
 pub(crate) use listener::ListenerResource;
 pub(crate) use listener::RouteSource;
-pub(crate) use route::DomainMatchType;
+pub(crate) use route::DomainMatcher;
 pub(crate) use route::HeaderMatchSpecifier;
 pub(crate) use route::HeaderMatcher;
 pub(crate) use route::PathSpecifier;
