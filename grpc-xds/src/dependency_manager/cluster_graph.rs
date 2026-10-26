@@ -183,13 +183,12 @@ impl<'a> Visited<'a> {
         }
     }
 
-    /// A cluster that gives its parent no leaves, and why, if there is a
-    /// reason to report.
-    fn no_leaves(reason: Option<Arc<str>>) -> Self {
+    /// A cluster that gives its parent no leaves, and why.
+    fn no_leaves(reason: Arc<str>) -> Self {
         Self {
             leaves: LeafClusters::Resolved {
                 names: Rc::from([]),
-                notes: reason.into_iter().collect(),
+                notes: Rc::from([reason]),
             },
             height: 0,
         }
@@ -217,7 +216,8 @@ enum Mark<'a> {
 ///   result, so that each cluster is computed only once per walk.
 /// * Paths are limited to [`MAX_AGGREGATE_DEPTH`]. A path that is too deep
 ///   returns [`DepthExceeded`], which fails every aggregate above it.
-/// * An edge that closes a cycle contributes no leaves, rather than failing.
+/// * An edge that closes a cycle contributes no leaves, only a note, rather
+///   than failing.
 /// * A pending child doesn't stop the search, so the watches of its siblings
 ///   are still recorded.
 ///
@@ -244,10 +244,15 @@ impl<'a> GraphWalker<'a> {
             return Err(DepthExceeded);
         }
         match self.marks.get(name) {
-            // A cycle. The edge back into the current path contributes
-            // nothing. Which edge gets cut depends on where the cycle is
-            // entered, which is deterministic because roots are sorted.
-            Some(Mark::OnPath) => return Ok(Visited::no_leaves(None)),
+            // A cycle. The edge back into the current path contributes no
+            // leaves, only a note. Which edge gets cut depends on where the
+            // cycle is entered, which is deterministic because roots are
+            // sorted.
+            Some(Mark::OnPath) => {
+                return Ok(Visited::no_leaves(
+                    format!("aggregate cluster {name} is part of a cycle").into(),
+                ));
+            }
             Some(Mark::Done(visited)) if depth + visited.height >= MAX_AGGREGATE_DEPTH => {
                 return Err(DepthExceeded);
             }
@@ -286,7 +291,7 @@ impl<'a> GraphWalker<'a> {
                 );
                 // An aggregate parent skips this cluster and keeps the reason
                 // in its note (gRFC A74).
-                return Ok(Visited::no_leaves(Some(reason.clone())));
+                return Ok(Visited::no_leaves(reason.clone()));
             }
             Some(WatchState::Ready { value, note }) => (value, note.as_ref()),
         };
@@ -1006,7 +1011,8 @@ mod tests {
 
         assert_eq!(
             error(&graph, "X"),
-            "aggregate cluster dependency graph for X has no leaf clusters"
+            "aggregate cluster dependency graph for X has no leaf clusters: \
+             aggregate cluster X is part of a cycle"
         );
     }
 
@@ -1018,15 +1024,31 @@ mod tests {
             .with_aggregate("X", ["Y", "L"])
             .with_aggregate("Y", ["X"]);
 
-        // Entered at X: the edge Y -> X is cut, so Y has no leaves.
+        // Entered at X: the edge Y -> X is cut, so Y has no leaves. The cycle
+        // note goes up to X, which still has L.
         let graph = walk_roots(&cache, &["X"]);
         assert_eq!(leaves(&graph, "X"), ["L"]);
-        assert!(error(&graph, "Y").contains("for Y has no leaf clusters"));
+        assert_eq!(
+            aggregate(&graph, "X").resolution_note.as_deref(),
+            Some("aggregate cluster X is part of a cycle")
+        );
+        assert_eq!(
+            error(&graph, "Y"),
+            "aggregate cluster dependency graph for Y has no leaf clusters: \
+             aggregate cluster X is part of a cycle"
+        );
 
         // Entered at Y: the edge X -> Y is cut instead.
         let graph = walk_roots(&cache, &["Y"]);
         assert_eq!(leaves(&graph, "Y"), ["L"]);
         assert_eq!(leaves(&graph, "X"), ["L"]);
+        for name in ["X", "Y"] {
+            assert_eq!(
+                aggregate(&graph, name).resolution_note.as_deref(),
+                Some("aggregate cluster Y is part of a cycle"),
+                "{name}"
+            );
+        }
 
         // With both as roots, the result doesn't depend on the order given.
         let x_first = walk_roots(&cache, &["X", "Y"]);
