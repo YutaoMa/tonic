@@ -133,7 +133,7 @@ enum LeafClusters<'a> {
     /// Something at or below the cluster hasn't arrived yet.
     Pending,
     /// The leaf clusters at or below this cluster, in priority order, and
-    /// the the aggregated error notes.
+    /// the aggregated error notes.
     Resolved {
         names: Rc<[&'a str]>,
         notes: Rc<[Arc<str>]>,
@@ -155,7 +155,6 @@ impl From<DepthExceeded> for ClusterResolutionError {
 
 /// A cluster's [`LeafClusters`], plus the height of the aggregate tree below
 /// it.
-///
 #[derive(Debug, Clone)]
 struct Visited<'a> {
     // Results are reused for every parent that reaches a cluster.
