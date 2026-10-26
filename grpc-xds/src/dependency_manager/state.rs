@@ -52,14 +52,15 @@ impl<T> WatchState<T> {
         };
     }
 
-    /// Applies an `AmbientError` event, or a failed DNS resolution: keeps any
-    /// cached value and attaches `reason` to it as a note. Without a cached
-    /// value this becomes `Failed`, since gRFC A74 treats an error before the
-    /// first valid resource as a failure.
+    /// Applies an `AmbientError` event: attaches `reason` to the cached value
+    /// as a note.
+    ///
+    /// The XdsClient sends ambient errors only once a value is cached, and
+    /// otherwise sends a `ResourceChanged` error (gRFC A88). Any other ambient
+    /// error is ignored, so that it can't hide the reason a watch failed.
     fn on_ambient_error(&mut self, reason: Arc<str>) {
-        match self {
-            Self::Ready { note, .. } => *note = Some(reason),
-            Self::Pending | Self::Failed(_) => *self = Self::Failed(reason),
+        if let Self::Ready { note, .. } = self {
+            *note = Some(reason);
         }
     }
 }
@@ -101,14 +102,15 @@ mod tests {
             (ready(1, None), Changed(Err("gone")), failed("gone")),
             (failed("old"), Changed(Err("gone")), failed("gone")),
             // An ambient error keeps a cached value and only replaces its note.
-            (Pending, Ambient("down"), failed("down")),
             (ready(1, None), Ambient("down"), ready(1, Some("down"))),
             (
                 ready(1, Some("old")),
                 Ambient("down"),
                 ready(1, Some("down")),
             ),
-            (failed("old"), Ambient("down"), failed("down")),
+            // Without a cached value, it's ignored, keeping the failure reason.
+            (Pending, Ambient("down"), Pending),
+            (failed("gone"), Ambient("down"), failed("gone")),
         ] {
             let mut state = start.clone();
             match &event {
