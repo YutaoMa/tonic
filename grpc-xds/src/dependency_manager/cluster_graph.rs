@@ -259,6 +259,9 @@ impl<'a> GraphWalker<'a> {
             Some(Mark::Done(visited)) => return Ok(visited.clone()),
             None => {}
         }
+        // An earlier attempt that was too deep may have left an error. Clear
+        // it, so that a pending result leaves the cluster out.
+        self.graph.cluster_configs.remove(name);
         self.marks.insert(name, Mark::OnPath);
         let result = self.visit_uncached(name, depth);
         match &result {
@@ -1100,6 +1103,31 @@ mod tests {
             assert_depth_exceeded(&graph, deep);
             assert_depth_exceeded(&graph, &deep1);
         }
+    }
+
+    #[test]
+    fn cluster_too_deep_on_one_path_is_recomputed_on_a_shorter_one() {
+        // Roots a0 and m, with a0 = [a1], ..., a14 = [m] and m = [K, P],
+        // K = [L]. Through a0, m is at depth 15, so K is too deep and m fails.
+        // Reached again as a root, m is recomputed and must not keep that
+        // error.
+        let cache = CachedResources::default()
+            .with_chain("a", 15, "m")
+            .with_aggregate("m", ["K", "P"])
+            .with_aggregate("K", ["L"])
+            .with_leaf("L");
+
+        // P has no CDS resource yet, so m is pending.
+        let graph = walk_roots(&cache, &["a0", "m"]);
+        assert!(!graph.cluster_configs.contains_key("m"));
+        assert_depth_exceeded(&graph, "a0");
+        assert_depth_exceeded(&graph, "a14");
+
+        let cache = cache.with_leaf("P");
+        let graph = walk_roots(&cache, &["a0", "m"]);
+        assert_eq!(leaves(&graph, "m"), ["L", "P"]);
+        assert_depth_exceeded(&graph, "a0");
+        assert_depth_exceeded(&graph, "a14");
     }
 
     // ----- Roots -----
