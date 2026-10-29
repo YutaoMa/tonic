@@ -59,6 +59,9 @@ mod load_balancing;
 /// from a channel's Listener/RouteConfiguration/Cluster/Endpoints resources.
 mod xds_config;
 
+/// `grpc` crate based [`xds_client::Transport`] implementation.
+mod transport;
+
 /// The xDS dependency manager (gRFC A74), which watches the resources a
 /// channel depends on and assembles them into [`xds_config::XdsConfig`]
 /// snapshots.
