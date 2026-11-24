@@ -208,8 +208,10 @@ where
                 Poll::Ready(Some(Err(e))) => break Poll::Ready(LbError::DiscoverError(e.into())),
                 Poll::Ready(Some(Ok(Change::Insert(addr, idle)))) => {
                     tracing::trace!("discovery: insert {addr}");
+                    // Make before break: a ready channel for `addr` keeps
+                    // serving until its replacement connects and takes its
+                    // place in `place_after_connect`.
                     let _ = self.connecting.cancel(&addr);
-                    self.ready.swap_remove(&addr);
                     let _ = self.ejected.cancel(&addr);
                     members_changed |= self.members.insert(addr.clone());
                     // Note: the outlier-detection registry entry is
@@ -253,13 +255,17 @@ where
 
     /// Route a freshly-connected `ReadyChannel` based on its
     /// preserved outlier state: `None` → ready; `Some(0)` → un-eject
-    /// then ready; `Some(d)` → ejected for `d`.
+    /// then ready; `Some(d)` → ejected for `d`. It replaces any channel
+    /// still serving `addr` from before a re-insert.
     fn place_after_connect(
         &mut self,
         addr: EndpointAddress,
         ready: ReadyChannel<C::Service>,
         remaining: Option<Duration>,
     ) {
+        // The channel it replaces may have been ejected while this one
+        // connected.
+        let _ = self.ejected.cancel(&addr);
         match remaining {
             None => {
                 self.ready.insert(addr, ready);
@@ -269,6 +275,7 @@ where
                 self.ready.insert(addr, ready);
             }
             Some(d) => {
+                self.ready.swap_remove(&addr);
                 let ejected = ready.eject(
                     EjectionConfig {
                         timeout: d,
@@ -854,16 +861,31 @@ mod tests {
         drive_to_ready(&mut lb, &connector).await;
         assert_eq!(lb.ready.len(), 1);
 
-        // Re-insert same address — old ready evicted, new one connecting.
+        let old = connector.service(&addr(8080));
+
+        // Re-insert same address — the old channel keeps serving while the
+        // new one connects.
         tx.send(Ok(Change::Insert(addr(8080), IdleChannel::new(addr(8080)))))
             .await
             .unwrap();
-        assert!(poll_ready_now(&mut lb).is_none());
-        assert_eq!(lb.ready.len(), 0);
+        assert!(matches!(poll_ready_now(&mut lb), Some(Ok(()))));
         assert_eq!(connector.pending_count(), 1);
+        lb.call("hello").await.unwrap();
+        assert_eq!(old.call_count.load(Ordering::Relaxed), 1);
 
-        drive_to_ready(&mut lb, &connector).await;
+        // Once connected, the new channel replaces the old one.
+        connector.resolve_all();
+        let _ = poll_ready_now(&mut lb);
         assert_eq!(lb.ready.len(), 1);
+        lb.call("hello").await.unwrap();
+        assert_eq!(old.call_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            connector
+                .service(&addr(8080))
+                .call_count
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1433,6 +1455,53 @@ mod tests {
             "8084 must remain in the ejected pool after re-insert"
         );
         assert!(state_8084.is_ejected());
+    }
+
+    /// A channel ejected while its replacement connects gives way to the
+    /// replacement, which inherits the ejection; the old channel never
+    /// returns to `ready`.
+    #[tokio::test(start_paused = true)]
+    async fn test_outlier_detection_replacement_of_channel_ejected_while_connecting() {
+        let mut config = fp_config(50, 5, 3);
+        config.base_ejection_time = Duration::from_secs(10);
+        config.max_ejection_time = Duration::from_secs(60);
+
+        let (tx, discover) = new_discover();
+        let (mut lb, connector, registry) = make_lb_with_outlier(discover, config);
+
+        for port in 8080..=8084 {
+            tx.send(Ok(Change::Insert(addr(port), IdleChannel::new(addr(port)))))
+                .await
+                .unwrap();
+        }
+        drive_to_ready(&mut lb, &connector).await;
+        let old = connector.service(&addr(8084));
+
+        tx.send(Ok(Change::Insert(addr(8084), IdleChannel::new(addr(8084)))))
+            .await
+            .unwrap();
+        let _ = poll_ready_now(&mut lb);
+        old.fail_call.store(true, Ordering::Relaxed);
+        for _ in 0..100 {
+            let _ = lb.call("hello").await;
+        }
+        registry.run_housekeeping();
+        let _ = poll_ready_now(&mut lb);
+        assert!(lb.ejected.contains_key(&addr(8084)));
+
+        connector.resolve_all();
+        let _ = poll_ready_now(&mut lb);
+        assert!(lb.ejected.contains_key(&addr(8084)));
+        assert!(!lb.ready.contains_key(&addr(8084)));
+
+        tokio::time::advance(Duration::from_secs(11)).await;
+        let _ = poll_ready_now(&mut lb);
+        assert!(lb.ready.contains_key(&addr(8084)));
+        let old_calls = old.call_count.load(Ordering::Relaxed);
+        for _ in 0..100 {
+            lb.call("hello").await.unwrap();
+        }
+        assert_eq!(old.call_count.load(Ordering::Relaxed), old_calls);
     }
 
     /// Once `base × multiplier` time elapses on an ejected channel,
